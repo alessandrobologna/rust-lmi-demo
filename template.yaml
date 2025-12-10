@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  rust-lmi-demo
+  An AWS Serverless Application Model (SAM) template for a Rust-based Lambda function using Lambda Managed Instances (LMI) capacity provider.
+Parameters:
+  ManagedInstancesSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet IDs for the Lambda Managed Instances capacity provider
+  ManagedInstancesSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group ID for the Lambda Managed Instances capacity provider
+
+Globals:
+  Function:
+    Timeout: 3
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+      ApplicationLogLevel: DEBUG
+      SystemLogLevel: DEBUG
+  Api:
+    TracingEnabled: true
+
+Resources:
+  HelloWorldApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      TracingEnabled: true
+      EndpointConfiguration: REGIONAL
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          MetricsEnabled: true
+          DataTraceEnabled: true
+          LoggingLevel: INFO
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency"}'
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-access-logs"
+      RetentionInDays: 7
+
+  ProxyCapacityProvider:
+    Type: AWS::Serverless::CapacityProvider
+    Properties:
+      CapacityProviderName: !Sub ${AWS::StackName}-proxy-capacity-provider
+      VpcConfig:
+        SubnetIds:
+          - !Select [0, !Ref ManagedInstancesSubnetIds]
+          - !Select [1, !Ref ManagedInstancesSubnetIds]
+        SecurityGroupIds:
+          - !Ref ManagedInstancesSecurityGroupId
+      InstanceRequirements:
+        Architectures:
+          - arm64
+
+  HelloWorldFunctionDefault:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-default    
+      CodeUri: ./rust_app
+      Handler: bootstrap
+      Runtime: provided.al2023
+      MemorySize: 128
+      Architectures:
+      - arm64
+      Events:
+        HelloWorld:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HelloWorldApi
+            Path: /default/hello
+            Method: get
+
+  HelloWorldFunctionLMI:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-lmi    
+      CodeUri: ./rust_app 
+      Handler: bootstrap
+      Runtime: provided.al2023
+      MemorySize: 2048
+      Architectures:
+      - arm64
+      CapacityProviderConfig:
+        Arn: !GetAtt ProxyCapacityProvider.Arn
+        ExecutionEnvironmentMemoryGiBPerVCpu: 2
+        PerExecutionEnvironmentMaxConcurrency: 64
+      Events:
+        HelloWorld:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HelloWorldApi
+            Path: /lmi/hello/
+            Method: get
+
+Outputs:
+  HelloWorldApiDefaultEndpoint:
+    Description: API Gateway endpoint URL for prod stage for Default Hello World function
+    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/default/hello"
+  HelloWorldApiLMIEndpoint:
+    Description: API Gateway endpoint URL for prod stage for LMI Hello World function
+    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/lmi/hello/"
+  HelloWorldFunctionDefault:
+    Description: Hello World Lambda Function ARN
+    Value: !GetAtt HelloWorldFunctionDefault.Arn
+  HelloWorldFunctionDefaultIamRole:
+    Description: Implicit IAM Role created for Hello World function
+    Value: !GetAtt HelloWorldFunctionDefaultRole.Arn
