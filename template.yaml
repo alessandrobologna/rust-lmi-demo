@@ -45,19 +45,6 @@ Resources:
       LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-access-logs"
       RetentionInDays: 7
 
-  ProxyCapacityProvider:
-    Type: AWS::Serverless::CapacityProvider
-    Properties:
-      CapacityProviderName: !Sub ${AWS::StackName}-proxy-capacity-provider
-      VpcConfig:
-        SubnetIds:
-          - !Select [0, !Ref ManagedInstancesSubnetIds]
-          - !Select [1, !Ref ManagedInstancesSubnetIds]
-        SecurityGroupIds:
-          - !Ref ManagedInstancesSecurityGroupId
-      InstanceRequirements:
-        Architectures:
-          - arm64
 
   HelloWorldFunctionDefault:
     Type: AWS::Serverless::Function
@@ -79,6 +66,22 @@ Resources:
             Path: /default/hello
             Method: get
 
+  CapacityProvider:
+    Type: AWS::Serverless::CapacityProvider
+    Properties:
+      CapacityProviderName: !Sub ${AWS::StackName}-cp-2-c8xlarge
+      VpcConfig:
+        SubnetIds:
+          - !Select [0, !Ref ManagedInstancesSubnetIds]
+          - !Select [1, !Ref ManagedInstancesSubnetIds]
+        SecurityGroupIds:
+          - !Ref ManagedInstancesSecurityGroupId
+      InstanceRequirements:
+        AllowedTypes:
+          - c8g.xlarge  
+        Architectures:
+          - arm64
+
   HelloWorldFunctionLMI:
     Type: AWS::Serverless::Function
     Metadata:
@@ -92,9 +95,12 @@ Resources:
       Architectures:
       - arm64
       CapacityProviderConfig:
-        Arn: !GetAtt ProxyCapacityProvider.Arn
+        Arn: !GetAtt CapacityProvider.Arn
         ExecutionEnvironmentMemoryGiBPerVCpu: 2
         PerExecutionEnvironmentMaxConcurrency: 64
+      Environment:
+        Variables:
+          RUST_LOG: debug
       Events:
         HelloWorld:
           Type: Api
