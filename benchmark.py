@@ -13,11 +13,14 @@ pre-installing dependencies:
 
 The script:
   1. Fetches API endpoints from CloudFormation stack outputs.
-  2. Runs k6 load test comparing Default vs LMI endpoints.
+  2. Runs k6 load tests for CPU and I/O(wait) scenarios.
   3. Parses the CSV results and generates comparison charts.
 """
 import os
 import subprocess
+import json
+import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +29,51 @@ import click
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+from matplotlib.patches import Patch
+
+
+MAX_DELAY_MS = 15_000
+MAX_HASH_LOOPS = 1_000_000
+
+
+def extract_endpoint(extra_tags: str) -> str:
+    if pd.isna(extra_tags):
+        return "unknown"
+    for part in str(extra_tags).split(","):
+        part = part.strip()
+        if part.startswith("endpoint="):
+            value = part.removeprefix("endpoint=").strip()
+            if value.lower() == "lmi":
+                return "LMI"
+            return value
+    return "unknown"
+
+
+_DURATION_PART_RE = re.compile(r"(\d+)([smh])")
+
+
+def parse_duration_to_seconds(value: str) -> int:
+    """Parse a k6-style duration string like '30s', '5m', or '1h30m' to seconds."""
+    if not value:
+        raise ValueError("duration is empty")
+
+    matches = list(_DURATION_PART_RE.finditer(value))
+    if not matches or "".join(m.group(0) for m in matches) != value:
+        raise ValueError(f"unsupported duration format: {value!r}")
+
+    total = 0
+    for match in matches:
+        amount = int(match.group(1))
+        unit = match.group(2)
+        if unit == "s":
+            total += amount
+        elif unit == "m":
+            total += amount * 60
+        elif unit == "h":
+            total += amount * 3600
+        else:
+            raise ValueError(f"unsupported duration unit: {unit}")
+    return total
 
 
 def get_stack_outputs(stack_name: str, region: str | None) -> dict[str, str]:
@@ -46,19 +94,104 @@ def get_stack_outputs(stack_name: str, region: str | None) -> dict[str, str]:
     return outputs
 
 
+def list_capacity_provider_instance_ids(
+    *,
+    region: str | None,
+    capacity_provider_arn: str,
+) -> list[str]:
+    """List EC2 instance IDs tagged for a Lambda managed instances capacity provider."""
+    client = boto3.client("ec2", region_name=region) if region else boto3.client("ec2")
+    paginator = client.get_paginator("describe_instances")
+    instance_ids: set[str] = set()
+    for page in paginator.paginate(
+        Filters=[
+            {"Name": "tag:aws:lambda:capacity-provider", "Values": [capacity_provider_arn]},
+            {"Name": "instance-state-name", "Values": ["pending", "running"]},
+        ],
+    ):
+        for reservation in page.get("Reservations", []):
+            for instance in reservation.get("Instances", []):
+                instance_id = instance.get("InstanceId")
+                if instance_id:
+                    instance_ids.add(instance_id)
+    return sorted(instance_ids)
+
+
+def resolve_capacity_provider_arn(*, region: str | None, stack_name: str, capacity_provider_arn: str | None) -> str | None:
+    """Resolve a Lambda capacity provider ARN used for EC2 scale-in waiting.
+
+    Returns None if region can't be determined and no ARN was provided.
+    """
+    if capacity_provider_arn:
+        return capacity_provider_arn
+
+    effective_region = region or boto3.session.Session().region_name
+    if not effective_region:
+        return None
+
+    sts = boto3.client("sts", region_name=effective_region)
+    account_id = sts.get_caller_identity()["Account"]
+    capacity_provider_name = f"{stack_name}-cp-2-c8xlarge"
+    return f"arn:aws:lambda:{effective_region}:{account_id}:capacity-provider:{capacity_provider_name}"
+
+
+def wait_for_capacity_provider_scale_in(
+    *,
+    region: str | None,
+    capacity_provider_arn: str,
+    baseline_count: int,
+    check_interval_seconds: int,
+    max_wait_minutes: int,
+) -> bool:
+    """Wait until capacity provider instance count returns to baseline_count."""
+    if check_interval_seconds <= 0:
+        raise ValueError("check_interval_seconds must be > 0")
+    if max_wait_minutes <= 0:
+        raise ValueError("max_wait_minutes must be > 0")
+
+    deadline = time.monotonic() + (max_wait_minutes * 60)
+    while True:
+        try:
+            instance_ids = list_capacity_provider_instance_ids(region=region, capacity_provider_arn=capacity_provider_arn)
+        except Exception as e:  # noqa: BLE001 - best-effort orchestration
+            print(f"Warning: failed to query EC2 for capacity provider instances ({e}); skipping scale-in wait.")
+            return False
+
+        current = len(instance_ids)
+        if current == baseline_count:
+            print(f"Capacity provider scaled in to baseline ({current} instances).")
+            return True
+        if time.monotonic() >= deadline:
+            print(
+                "Warning: timed out waiting for capacity provider scale-in "
+                f"(current={current}, baseline={baseline_count})."
+            )
+            return False
+
+        print(
+            "Waiting for capacity provider scale-in: "
+            f"current={current}, baseline={baseline_count} (check every {check_interval_seconds}s)"
+        )
+        time.sleep(check_interval_seconds)
+
+
 def run_k6_test(
-    default_url: str,
-    lmi_url: str,
+    targets: list[dict],
     csv_path: Path,
-    duration: str,
-    vus: int,
+    *,
+    stages: list[dict],
+    mode: str | None,
+    delay_ms: int,
+    hash_loops: int,
 ) -> None:
     """Run k6 load test with CSV output using environment variables."""
     env = os.environ.copy()
-    env["DEFAULT_URL"] = default_url
-    env["LMI_URL"] = lmi_url
-    env["DURATION"] = duration
-    env["VUS"] = str(vus)
+    env["TARGETS"] = json.dumps(targets)
+    env["STAGES"] = json.dumps(stages)
+    if mode is not None:
+        env["MODE"] = mode
+    env["DELAY_MS"] = str(delay_ms)
+    env["HASH_LOOPS"] = str(hash_loops)
 
     cmd = [
         "k6", "run",
@@ -67,7 +200,18 @@ def run_k6_test(
     ]
 
     print(f"Running: {' '.join(cmd)}")
-    print(f"  DURATION={duration}, VUS={vus}")
+    print(f"  STAGES={env['STAGES']}")
+    if mode is not None:
+        print(f"  MODE={mode}")
+        if mode == "per_endpoint":
+            try:
+                peak_vus = max(int(s["target"]) for s in stages)
+                print(f"  NOTE: per_endpoint runs one k6 scenario per endpoint (peak total VUs ≈ {peak_vus * len(targets)})")
+            except Exception:
+                pass
+    for t in targets:
+        print(f"  TARGET={t['name']} ({t['url']})")
+    print(f"  WORKLOAD: delay_ms={delay_ms}, hash_loops={hash_loops}")
 
     # Don't capture output - let k6 print to terminal
     result = subprocess.run(cmd, env=env)
@@ -78,29 +222,22 @@ def run_k6_test(
         print("Warning: k6 thresholds were crossed (this is expected under heavy load)")
 
 
-def parse_k6_csv(csv_path: Path) -> pd.DataFrame:
-    """Parse k6 CSV output into a DataFrame."""
-    df = pd.read_csv(csv_path)
-
-    # Filter for http_req_duration metric only
-    df = df[df["metric_name"] == "http_req_duration"].copy()
-
-    # Parse the extra_tags column to extract endpoint tag
-    def extract_endpoint(extra_tags: str) -> str:
-        if pd.isna(extra_tags):
-            return "unknown"
-        extra_str = str(extra_tags)
-        if "endpoint=default" in extra_str:
-            return "default"
-        elif "endpoint=lmi" in extra_str:
-            return "lmi"
-        return "unknown"
-
+def load_k6_csv(csv_path: Path) -> pd.DataFrame:
+    """Load k6 CSV output with only the columns we use."""
+    df = pd.read_csv(
+        csv_path,
+        usecols=["metric_name", "timestamp", "metric_value", "status", "extra_tags"],
+    )
     df["endpoint"] = df["extra_tags"].apply(extract_endpoint)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-    df["latency_ms"] = df["metric_value"]
+    return df
 
-    return df[["timestamp", "endpoint", "latency_ms"]]
+
+def parse_k6_latencies(df: pd.DataFrame) -> pd.DataFrame:
+    """Extract per-request latency samples from a loaded k6 CSV DataFrame."""
+    lat = df[df["metric_name"] == "http_req_duration"].copy()
+    lat["timestamp"] = pd.to_datetime(lat["timestamp"], unit="s", utc=True)
+    lat["latency_ms"] = lat["metric_value"]
+    return lat[["timestamp", "endpoint", "latency_ms"]]
 
 
 def calculate_stats(df: pd.DataFrame) -> pd.DataFrame:
@@ -118,11 +255,33 @@ def calculate_stats(df: pd.DataFrame) -> pd.DataFrame:
     return stats
 
 
+def calculate_error_stats(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate HTTP error counts/rates per endpoint from http_reqs rows."""
+    reqs = df[df["metric_name"] == "http_reqs"].copy()
+    reqs["status"] = pd.to_numeric(reqs["status"], errors="coerce")
+    reqs["is_error"] = reqs["status"] >= 400
+    reqs["is_4xx"] = (reqs["status"] >= 400) & (reqs["status"] < 500)
+    reqs["is_5xx"] = (reqs["status"] >= 500) & (reqs["status"] < 600)
+    reqs["is_429"] = reqs["status"] == 429
+
+    errors = reqs.groupby("endpoint").agg(
+        requests=("status", "count"),
+        errors=("is_error", "sum"),
+        errors_4xx=("is_4xx", "sum"),
+        errors_5xx=("is_5xx", "sum"),
+        errors_429=("is_429", "sum"),
+    )
+    errors["error_rate"] = (errors["errors"] / errors["requests"]).fillna(0.0).round(6)
+    return errors
+
+
 def plot_results(
     df: pd.DataFrame,
     stats: pd.DataFrame,
     output_path: Path,
-    duration: str,
+    stages: list[dict],
+    endpoints: list[str],
+    title: str,
 ) -> None:
     """Generate charts for the test run."""
     sns.set_theme(style="darkgrid", context="notebook", rc={
@@ -143,51 +302,79 @@ def plot_results(
         "legend.labelcolor": ".5",
     })
 
-    palette = {"default": "#4C78A8", "lmi": "#E45756"}
+    default_colors = {"128": "#4C78A8", "2048": "#F58518", "LMI": "#E45756", "lmi": "#E45756"}
+    fallback_colors = sns.color_palette("tab10", n_colors=max(len(endpoints), 3)).as_hex()
+    fallback_iter = iter(fallback_colors)
+    palette = {}
+    for endpoint in endpoints:
+        if endpoint in default_colors:
+            palette[endpoint] = default_colors[endpoint]
+        else:
+            palette[endpoint] = next(fallback_iter)
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
     min_ts = df["timestamp"].min()
     df["elapsed_seconds"] = (df["timestamp"] - min_ts).dt.total_seconds()
+    data_max_elapsed = float(df["elapsed_seconds"].max())
 
-    # Calculate phase boundaries
-    if duration.endswith("s"):
-        duration_seconds = int(duration[:-1])
-    elif duration.endswith("m"):
-        duration_seconds = int(duration[:-1]) * 60
-    else:
-        duration_seconds = 60
+    stage_durations = [parse_duration_to_seconds(s["duration"]) for s in stages]
+    stage_ends = []
+    total = 0
+    for d in stage_durations:
+        total += d
+        stage_ends.append(total)
+    stage_total_seconds = stage_ends[-1] if stage_ends else None
+    show_stage_markers = (
+        stage_total_seconds is not None and abs(stage_total_seconds - data_max_elapsed) <= max(30.0, data_max_elapsed * 0.10)
+    )
 
-    phase1_end = duration_seconds
-    phase2_end = duration_seconds * 2
-
-    # Plot 1: Latency over time
+    # Plot 1: Latency over time (scatter)
     ax1 = axes[0, 0]
-    for endpoint in ["default", "lmi"]:
-        data = df[df["endpoint"] == endpoint]
-        ax1.scatter(
-            data["elapsed_seconds"],
-            data["latency_ms"],
-            alpha=0.3,
-            s=10,
-            label=endpoint,
-            color=palette[endpoint],
-        )
+    max_scatter_points_per_endpoint = 50_000
+    scatter_parts = []
+    for endpoint in endpoints:
+        data = df[df["endpoint"] == endpoint][["elapsed_seconds", "latency_ms", "endpoint"]]
+        if len(data) > max_scatter_points_per_endpoint:
+            data = data.sample(n=max_scatter_points_per_endpoint, random_state=42)
+        scatter_parts.append(data)
 
-    ax1.axvline(x=phase1_end, color="gray", linestyle="--", alpha=0.5)
-    ax1.axvline(x=phase2_end, color="gray", linestyle="--", alpha=0.5)
+    scatter_df = pd.concat(scatter_parts, ignore_index=True)
+    scatter_df = scatter_df.sample(frac=1, random_state=42)  # avoid one series hiding the other
+
+    ax1.scatter(
+        scatter_df["elapsed_seconds"],
+        scatter_df["latency_ms"],
+        alpha=0.25,
+        s=8,
+        c=scatter_df["endpoint"].map(palette),
+        edgecolors="none",
+    )
+
+    if show_stage_markers:
+        for x in stage_ends[:-1]:
+            ax1.axvline(x=x, color="gray", linestyle="--", alpha=0.5)
     ymax = ax1.get_ylim()[1]
-    ax1.text(phase1_end / 2, ymax * 0.95, "Ramp Up", ha="center", fontsize=9, color=".5")
-    ax1.text((phase1_end + phase2_end) / 2, ymax * 0.95, "Sustained", ha="center", fontsize=9, color=".5")
-    ax1.text((phase2_end + duration_seconds * 3) / 2, ymax * 0.95, "Ramp Down", ha="center", fontsize=9, color=".5")
+    if show_stage_markers:
+        starts = [0] + stage_ends[:-1]
+        for i, (start, end) in enumerate(zip(starts, stage_ends, strict=False)):
+            start_target = 0 if i == 0 else int(stages[i - 1]["target"])
+            end_target = int(stages[i]["target"])
+            ax1.text(
+                (start + end) / 2,
+                ymax * 0.95,
+                f"{start_target}→{end_target} VUs",
+                ha="center",
+                fontsize=9,
+                color=".5",
+            )
     ax1.set_xlabel("Elapsed Time (seconds)")
     ax1.set_ylabel("Latency (ms)")
     ax1.set_title("Response Latency Over Time")
-    ax1.legend(title="Endpoint")
 
     # Plot 2: Rolling average
     ax2 = axes[0, 1]
-    for endpoint in ["default", "lmi"]:
+    for endpoint in endpoints:
         data = df[df["endpoint"] == endpoint].sort_values("elapsed_seconds")
         data_resampled = data.set_index("timestamp").resample("1s")["latency_ms"].mean().reset_index()
         data_resampled["elapsed_seconds"] = (data_resampled["timestamp"] - min_ts).dt.total_seconds()
@@ -199,19 +386,37 @@ def plot_results(
             linewidth=2,
         )
 
-    ax2.axvline(x=phase1_end, color="gray", linestyle="--", alpha=0.5)
-    ax2.axvline(x=phase2_end, color="gray", linestyle="--", alpha=0.5)
+    if show_stage_markers:
+        for x in stage_ends[:-1]:
+            ax2.axvline(x=x, color="gray", linestyle="--", alpha=0.5)
     ax2.set_xlabel("Elapsed Time (seconds)")
     ax2.set_ylabel("Avg Latency (ms)")
     ax2.set_title("Average Latency (1s buckets)")
-    ax2.legend(title="Endpoint")
+    # legend is shown at the figure level
 
     # Plot 3: Box plot
     ax3 = axes[1, 0]
-    sns.boxplot(data=df, x="endpoint", y="latency_ms", hue="endpoint", palette=palette, legend=False, ax=ax3)
+    sns.boxplot(
+        data=df,
+        x="endpoint",
+        y="latency_ms",
+        hue="endpoint",
+        order=list(endpoints),
+        hue_order=list(endpoints),
+        palette=palette,
+        dodge=False,
+        ax=ax3,
+    )
+    for patch in ax3.patches:
+        patch.set_edgecolor(patch.get_facecolor())
+        patch.set_linewidth(2)
+    legend = ax3.get_legend()
+    if legend:
+        legend.remove()
     ax3.set_xlabel("Endpoint")
     ax3.set_ylabel("Latency (ms)")
     ax3.set_title("Latency Distribution")
+    # legend is shown at the figure level
 
     # Plot 4: Stats comparison
     ax4 = axes[1, 1]
@@ -221,28 +426,47 @@ def plot_results(
         var_name="statistic",
         value_name="latency_ms",
     )
-    sns.barplot(data=stats_melted, x="statistic", y="latency_ms", hue="endpoint", palette=palette, ax=ax4)
+    sns.barplot(
+        data=stats_melted,
+        x="statistic",
+        y="latency_ms",
+        hue="endpoint",
+        hue_order=list(endpoints),
+        palette=palette,
+        ax=ax4,
+    )
     ax4.set_xlabel("Statistic")
     ax4.set_ylabel("Latency (ms)")
     ax4.set_title("Latency Statistics Comparison")
-    ax4.legend(title="Endpoint")
+    legend = ax4.get_legend()
+    if legend:
+        legend.remove()
 
-    fig.suptitle("Lambda Load Test: Default vs LMI", fontsize=14, y=1.02, color=".5")
-    fig.tight_layout()
+    fig.suptitle(title, fontsize=14, y=1.02, color=".5")
+    fig.legend(
+        handles=[Patch(facecolor=palette[e], edgecolor=palette[e], label=e) for e in endpoints],
+        title="Endpoint",
+        loc="lower center",
+        ncol=len(endpoints),
+        bbox_to_anchor=(0.5, 0.01),
+        frameon=False,
+    )
+    fig.tight_layout(rect=[0, 0.07, 1, 0.98])
     fig.savefig(output_path, transparent=True, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Wrote chart: {output_path}")
 
 
-def print_comparison_table(stats: pd.DataFrame) -> None:
+def print_comparison_table(stats: pd.DataFrame, *, baseline_name: str, variant_name: str) -> None:
     """Print a formatted comparison table."""
     print(f"\n{'=' * 70}")
     print("LOAD TEST RESULTS")
     print("=" * 70)
 
-    if "default" in stats.index and "lmi" in stats.index:
-        default = stats.loc["default"]
-        lmi = stats.loc["lmi"]
+    if baseline_name in stats.index and variant_name in stats.index:
+        baseline = stats.loc[baseline_name]
+        variant = stats.loc[variant_name]
+        value_width = max(len(baseline_name), len(variant_name), 7) + 2
 
         def diff_pct(d: float, l: float) -> str:
             if d == 0:
@@ -251,28 +475,131 @@ def print_comparison_table(stats: pd.DataFrame) -> None:
             sign = "+" if pct > 0 else ""
             return f"{sign}{pct:.1f}%"
 
-        print(f"\n{'Metric':<20} {'Default':>12} {'LMI':>12} {'Diff':>10}")
+        def diff_pp(d: float, l: float) -> str:
+            return f"{(l - d):+.1f}pp"
+
+        print(f"\n{'Metric':<20} {baseline_name:>{value_width}} {variant_name:>{value_width}} {'Diff':>10}")
         print("-" * 56)
-        print(f"{'Requests':<20} {int(default['count']):>12} {int(lmi['count']):>12} {'':>10}")
-        print(f"{'Avg Latency (ms)':<20} {default['avg']:>12.1f} {lmi['avg']:>12.1f} {diff_pct(default['avg'], lmi['avg']):>10}")
-        print(f"{'Min Latency (ms)':<20} {default['min']:>12.1f} {lmi['min']:>12.1f} {diff_pct(default['min'], lmi['min']):>10}")
-        print(f"{'p50 Latency (ms)':<20} {default['p50']:>12.1f} {lmi['p50']:>12.1f} {diff_pct(default['p50'], lmi['p50']):>10}")
-        print(f"{'p90 Latency (ms)':<20} {default['p90']:>12.1f} {lmi['p90']:>12.1f} {diff_pct(default['p90'], lmi['p90']):>10}")
-        print(f"{'p95 Latency (ms)':<20} {default['p95']:>12.1f} {lmi['p95']:>12.1f} {diff_pct(default['p95'], lmi['p95']):>10}")
-        print(f"{'p99 Latency (ms)':<20} {default['p99']:>12.1f} {lmi['p99']:>12.1f} {diff_pct(default['p99'], lmi['p99']):>10}")
-        print(f"{'Max Latency (ms)':<20} {default['max']:>12.1f} {lmi['max']:>12.1f} {diff_pct(default['max'], lmi['max']):>10}")
+        print(f"{'Requests':<20} {int(baseline['count']):>{value_width}} {int(variant['count']):>{value_width}} {'':>10}")
+        if "errors_4xx" in stats.columns:
+            print(
+                f"{'HTTP 4xx':<20} {int(baseline.get('errors_4xx', 0)):>{value_width}} {int(variant.get('errors_4xx', 0)):>{value_width}} {'':>10}"
+            )
+        if "errors_429" in stats.columns:
+            print(
+                f"{'HTTP 429':<20} {int(baseline.get('errors_429', 0)):>{value_width}} {int(variant.get('errors_429', 0)):>{value_width}} {'':>10}"
+            )
+        if "errors_5xx" in stats.columns:
+            print(
+                f"{'HTTP 5xx':<20} {int(baseline.get('errors_5xx', 0)):>{value_width}} {int(variant.get('errors_5xx', 0)):>{value_width}} {'':>10}"
+            )
+        if "error_rate" in stats.columns:
+            print(
+                f"{'Error rate':<20} {baseline.get('error_rate', 0.0) * 100:>{value_width}.1f}% {variant.get('error_rate', 0.0) * 100:>{value_width}.1f}% {diff_pp(baseline.get('error_rate', 0.0) * 100, variant.get('error_rate', 0.0) * 100):>10}"
+            )
+        print(f"{'Avg Latency (ms)':<20} {baseline['avg']:>{value_width}.1f} {variant['avg']:>{value_width}.1f} {diff_pct(baseline['avg'], variant['avg']):>10}")
+        print(f"{'Min Latency (ms)':<20} {baseline['min']:>{value_width}.1f} {variant['min']:>{value_width}.1f} {diff_pct(baseline['min'], variant['min']):>10}")
+        print(f"{'p50 Latency (ms)':<20} {baseline['p50']:>{value_width}.1f} {variant['p50']:>{value_width}.1f} {diff_pct(baseline['p50'], variant['p50']):>10}")
+        print(f"{'p90 Latency (ms)':<20} {baseline['p90']:>{value_width}.1f} {variant['p90']:>{value_width}.1f} {diff_pct(baseline['p90'], variant['p90']):>10}")
+        print(f"{'p95 Latency (ms)':<20} {baseline['p95']:>{value_width}.1f} {variant['p95']:>{value_width}.1f} {diff_pct(baseline['p95'], variant['p95']):>10}")
+        print(f"{'p99 Latency (ms)':<20} {baseline['p99']:>{value_width}.1f} {variant['p99']:>{value_width}.1f} {diff_pct(baseline['p99'], variant['p99']):>10}")
+        print(f"{'Max Latency (ms)':<20} {baseline['max']:>{value_width}.1f} {variant['max']:>{value_width}.1f} {diff_pct(baseline['max'], variant['max']):>10}")
         print("-" * 56)
     else:
         print(stats.to_string())
 
-    print("=" * 70 + "\n")
+        print("=" * 70 + "\n")
+
+
+def print_endpoint_table(stats: pd.DataFrame, *, endpoints: list[str]) -> None:
+    """Print a formatted table of per-endpoint stats."""
+    print(f"\n{'=' * 70}")
+    print("LOAD TEST RESULTS")
+    print("=" * 70)
+
+    cols = ["count", "errors_4xx", "errors_429", "errors_5xx", "error_rate", "avg", "p95", "p99", "max"]
+    missing = [c for c in cols if c not in stats.columns]
+    if missing:
+        print(stats.to_string())
+        return
+
+    name_width = max(max(len(e) for e in endpoints), len("Endpoint")) + 2
+    print(
+        f"\n{'Endpoint':<{name_width}} {'Reqs':>10} {'4xx':>6} {'429':>6} {'5xx':>6} {'Err%':>7} {'Avg(ms)':>10} {'p95':>10} {'p99':>10} {'Max':>10}"
+    )
+    print("-" * (name_width + 10 + 6 + 6 + 6 + 7 + 10 + 10 + 10 + 10 + 9))
+
+    for endpoint in endpoints:
+        if endpoint not in stats.index:
+            continue
+        row = stats.loc[endpoint]
+        print(
+            f"{endpoint:<{name_width}} "
+            f"{int(row['count']):>10} "
+            f"{int(row.get('errors_4xx', 0)):>6} "
+            f"{int(row.get('errors_429', 0)):>6} "
+            f"{int(row.get('errors_5xx', 0)):>6} "
+            f"{row.get('error_rate', 0.0) * 100:>6.1f}% "
+            f"{row['avg']:>10.1f} "
+            f"{row['p95']:>10.1f} "
+            f"{row['p99']:>10.1f} "
+            f"{row['max']:>10.1f}"
+        )
 
 
 @click.command()
 @click.option("--stack", "stack_name", required=True, help="CloudFormation stack name")
 @click.option("--region", default=None, help="AWS region (overrides AWS_REGION)")
-@click.option("--duration", default="30s", help="Duration per phase (ramp up, sustain, ramp down)")
-@click.option("--vus", default=50, type=int, help="Number of virtual users at peak")
+@click.option("--duration", default="30s", help="Duration per k6 stage (only used with --stage-targets)")
+@click.option(
+    "--stage-targets",
+    default=None,
+    help="Comma-separated k6 stage targets (each uses --duration), e.g. '20,20,40'. Overrides the default 0→64 (3m), 64→64 (6m), 64→128 (3m) phases.",
+)
+@click.option(
+    "--stages-json",
+    default=None,
+    help="Full k6 stages JSON (advanced). Overrides --stage-targets.",
+)
+@click.option(
+    "--scenario",
+    type=click.Choice(["fast-io", "slow-io", "low-cpu", "high-cpu", "all"]),
+    default="all",
+    show_default=True,
+    help="Which scenario(s) to run: fast-io, slow-io, low-cpu, high-cpu, or all.",
+)
+@click.option(
+    "--cpu-low-hash-loops",
+    "--cpu-hash-loops",
+    "cpu_low_hash_loops",
+    type=int,
+    default=50_000,
+    show_default=True,
+    help="hash_loops used for the Low CPU scenario (delay_ms=0).",
+)
+@click.option(
+    "--cpu-high-hash-loops",
+    type=int,
+    default=200_000,
+    show_default=True,
+    help="hash_loops used for the High CPU scenario (delay_ms=0).",
+)
+@click.option(
+    "--io-fast-delay-ms",
+    "--io-delay-ms",
+    "io_fast_delay_ms",
+    type=int,
+    default=100,
+    show_default=True,
+    help="delay_ms used for the Fast I/O scenario (hash_loops=0).",
+)
+@click.option(
+    "--io-slow-delay-ms",
+    type=int,
+    default=500,
+    show_default=True,
+    help="delay_ms used for the Slow I/O scenario (hash_loops=0).",
+)
 @click.option(
     "--output-dir",
     "output_dir",
@@ -286,16 +613,59 @@ def print_comparison_table(stats: pd.DataFrame) -> None:
     default=False,
     help="Skip running k6 and regenerate charts from existing CSV",
 )
+@click.option(
+    "--wait-for-scale-in/--no-wait-for-scale-in",
+    default=None,
+    help="When running multiple scenarios, wait for the LMI capacity provider to scale back to its pre-run EC2 instance count before starting the next scenario.",
+)
+@click.option(
+    "--capacity-provider-arn",
+    default=None,
+    help="Capacity provider ARN used to detect scale-out/scale-in EC2 instances (defaults to arn:aws:lambda:<region>:<account>:capacity-provider:<stack>-cp-2-c8xlarge).",
+)
+@click.option(
+    "--scale-in-check-seconds",
+    type=int,
+    default=60,
+    show_default=True,
+    help="How often to check EC2 instance count while waiting for scale-in.",
+)
+@click.option(
+    "--scale-in-max-minutes",
+    type=int,
+    default=90,
+    show_default=True,
+    help="Maximum time to wait for scale-in between scenarios.",
+)
 def main(
     stack_name: str,
     region: str | None,
     duration: str,
-    vus: int,
+    stage_targets: str | None,
+    stages_json: str | None,
+    scenario: str,
+    cpu_low_hash_loops: int,
+    cpu_high_hash_loops: int,
+    io_fast_delay_ms: int,
+    io_slow_delay_ms: int,
     output_dir: Path,
     skip_test: bool,
+    wait_for_scale_in: bool | None,
+    capacity_provider_arn: str | None,
+    scale_in_check_seconds: int,
+    scale_in_max_minutes: int,
 ) -> None:
-    """Run load test benchmark comparing Default vs LMI Lambda endpoints."""
+    """Run load test benchmarks comparing standard vs LMI Lambda endpoints."""
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if io_fast_delay_ms < 0 or io_fast_delay_ms > MAX_DELAY_MS:
+        raise SystemExit(f"--io-fast-delay-ms must be between 0 and {MAX_DELAY_MS}")
+    if io_slow_delay_ms < 0 or io_slow_delay_ms > MAX_DELAY_MS:
+        raise SystemExit(f"--io-slow-delay-ms must be between 0 and {MAX_DELAY_MS}")
+    if cpu_low_hash_loops < 0 or cpu_low_hash_loops > MAX_HASH_LOOPS:
+        raise SystemExit(f"--cpu-low-hash-loops must be between 0 and {MAX_HASH_LOOPS}")
+    if cpu_high_hash_loops < 0 or cpu_high_hash_loops > MAX_HASH_LOOPS:
+        raise SystemExit(f"--cpu-high-hash-loops must be between 0 and {MAX_HASH_LOOPS}")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -303,45 +673,191 @@ def main(
     print(f"Fetching endpoints from stack: {stack_name}")
     outputs = get_stack_outputs(stack_name, region)
 
-    default_url = outputs.get("HelloWorldApiDefaultEndpoint")
-    lmi_url = outputs.get("HelloWorldApiLMIEndpoint")
+    url_2048 = outputs.get("HelloWorldApi2048Endpoint") or outputs.get("HelloWorldApiDefaultEndpoint")
+    url_128 = outputs.get("HelloWorldApi128Endpoint")
+    url_lmi = outputs.get("HelloWorldApiLMIEndpoint")
 
-    if not default_url or not lmi_url:
+    if not url_2048 or not url_128 or not url_lmi:
         raise SystemExit(f"Could not find endpoint outputs. Found: {list(outputs.keys())}")
 
-    print(f"Default URL: {default_url}")
-    print(f"LMI URL: {lmi_url}")
+    print(f"2048 URL: {url_2048}")
+    if url_128:
+        print(f"128  URL: {url_128}")
+    print(f"LMI  URL: {url_lmi}")
 
-    csv_path = output_dir / f"k6-{timestamp}.csv"
-    chart_path = output_dir / f"benchmark-{timestamp}.png"
+    def timestamp_from_csv_path(path: Path, *, scenario_name: str) -> str | None:
+        prefix = f"k6-{scenario_name}-"
+        if path.stem.startswith(prefix):
+            return path.stem.removeprefix(prefix)
+        return None
 
-    if skip_test:
-        # Find most recent CSV
-        csv_files = sorted(output_dir.glob("k6-*.csv"), reverse=True)
-        if not csv_files:
-            raise SystemExit("No CSV found. Run without --skip-test first.")
-        csv_path = csv_files[0]
-        print(f"Using existing CSV: {csv_path}")
+    if stages_json:
+        try:
+            stages = json.loads(stages_json)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"Invalid --stages-json: {e}") from e
+        if not isinstance(stages, list) or not stages:
+            raise SystemExit("--stages-json must be a non-empty JSON array")
+    elif stage_targets:
+        try:
+            stage_target_values = [int(x.strip()) for x in stage_targets.split(",") if x.strip()]
+        except ValueError as e:
+            raise SystemExit("--stage-targets must be a comma-separated list of integers") from e
+        if not stage_target_values:
+            raise SystemExit("--stage-targets must contain at least one target")
+        stages = [{"duration": duration, "target": t} for t in stage_target_values]
     else:
+        stages = [
+            {"duration": "3m", "target": 64},
+            {"duration": "6m", "target": 64},
+            {"duration": "3m", "target": 128},
+        ]
+
+    try:
+        for stage in stages:
+            parse_duration_to_seconds(stage["duration"])
+            if int(stage["target"]) < 0:
+                raise ValueError("target must be non-negative")
+    except (KeyError, TypeError, ValueError) as e:
+        raise SystemExit(f"Invalid stages configuration: {e}") from e
+
+    def latest_csv_for(scenario_name: str) -> Path:
+        csv_files = sorted(output_dir.glob(f"k6-{scenario_name}-*.csv"), reverse=True)
+        if not csv_files:
+            raise SystemExit(f"No CSV found for scenario '{scenario_name}'. Run without --skip-test first.")
+        return csv_files[0]
+
+    scenarios = ["fast-io", "slow-io", "low-cpu", "high-cpu"] if scenario == "all" else [scenario]
+    wait_between_scenarios = (wait_for_scale_in if wait_for_scale_in is not None else scenario == "all") and not skip_test
+    capacity_provider_arn_resolved = None
+    baseline_instance_count: int | None = None
+    if wait_between_scenarios:
+        capacity_provider_arn_resolved = resolve_capacity_provider_arn(
+            region=region,
+            stack_name=stack_name,
+            capacity_provider_arn=capacity_provider_arn,
+        )
+        if capacity_provider_arn_resolved is None:
+            print(
+                "Warning: --wait-for-scale-in is enabled but region is not set and capacity provider ARN can't be derived. "
+                "Pass --region or --capacity-provider-arn to enable scale-in waiting."
+            )
+            wait_between_scenarios = False
+        else:
+            try:
+                baseline_instance_count = len(
+                    list_capacity_provider_instance_ids(region=region, capacity_provider_arn=capacity_provider_arn_resolved)
+                )
+                print(
+                    f"Capacity provider baseline: {baseline_instance_count} instances "
+                    f"(tag aws:lambda:capacity-provider={capacity_provider_arn_resolved})"
+                )
+            except Exception as e:  # noqa: BLE001 - best-effort orchestration
+                print(f"Warning: failed to query EC2 for capacity provider instances ({e}); disabling scale-in waiting.")
+                wait_between_scenarios = False
+                capacity_provider_arn_resolved = None
+                baseline_instance_count = None
+    for scenario_name in scenarios:
+        scenario_display = {
+            "fast-io": "Fast I/O",
+            "slow-io": "Slow I/O",
+            "low-cpu": "Low CPU",
+            "high-cpu": "High CPU",
+        }.get(scenario_name, scenario_name)
+        endpoint_targets = [
+            {"name": "128", "url": url_128},
+            {"name": "2048", "url": url_2048},
+            {"name": "LMI", "url": url_lmi},
+        ]
+
+        if scenario_name == "fast-io":
+            delay_ms, hash_loops = io_fast_delay_ms, 0
+            title = f"Lambda Load Test (Fast I/O wait): 128 vs 2048 vs LMI (delay_ms={delay_ms})"
+        elif scenario_name == "slow-io":
+            delay_ms, hash_loops = io_slow_delay_ms, 0
+            title = f"Lambda Load Test (Slow I/O wait): 128 vs 2048 vs LMI (delay_ms={delay_ms})"
+        elif scenario_name == "low-cpu":
+            delay_ms, hash_loops = 0, cpu_low_hash_loops
+            title = f"Lambda Load Test (Low CPU): 128 vs 2048 vs LMI (hash_loops={hash_loops})"
+        elif scenario_name == "high-cpu":
+            delay_ms, hash_loops = 0, cpu_high_hash_loops
+            title = f"Lambda Load Test (High CPU): 128 vs 2048 vs LMI (hash_loops={hash_loops})"
+        else:
+            raise SystemExit(f"Unknown scenario: {scenario_name}")
+
+        mode = "per_endpoint"
+
+        endpoints = [t["name"] for t in endpoint_targets]
+        csv_path = output_dir / f"k6-{scenario_name}-{timestamp}.csv"
+        chart_path = output_dir / f"benchmark-{scenario_name}-{timestamp}.png"
+
         print(f"\n{'=' * 70}")
-        print(f"RUNNING TEST: {vus} VUs, {duration} per phase")
+        print(f"SCENARIO: {scenario_display} ({scenario_name})")
         print("=" * 70)
-        run_k6_test(default_url, lmi_url, csv_path, duration, vus)
 
-    # Parse and analyze
-    print(f"\nParsing results from: {csv_path}")
-    df = parse_k6_csv(csv_path)
+        if skip_test:
+            csv_path = latest_csv_for(scenario_name)
+            existing_timestamp = timestamp_from_csv_path(csv_path, scenario_name=scenario_name)
+            if existing_timestamp:
+                chart_path = output_dir / f"benchmark-{scenario_name}-{existing_timestamp}.png"
+            print(f"Using existing CSV: {csv_path}")
+        else:
+            print(f"RUNNING TEST: stages={stages}")
+            run_k6_test(
+                endpoint_targets,
+                csv_path,
+                stages=stages,
+                mode=mode,
+                delay_ms=delay_ms,
+                hash_loops=hash_loops,
+            )
 
-    if df.empty:
-        raise SystemExit("No data found in CSV.")
+        print(f"\nParsing results from: {csv_path}")
+        raw_df = load_k6_csv(csv_path)
+        latency_df = parse_k6_latencies(raw_df)
+        if latency_df.empty:
+            raise SystemExit("No data found in CSV.")
 
-    stats = calculate_stats(df)
+        if skip_test:
+            stage_total_seconds = sum(parse_duration_to_seconds(s["duration"]) for s in stages)
+            data_total_seconds = (latency_df["timestamp"].max() - latency_df["timestamp"].min()).total_seconds()
+            if abs(stage_total_seconds - data_total_seconds) > max(30.0, data_total_seconds * 0.10):
+                print(
+                    "Warning: stage configuration does not match CSV duration "
+                    f"(stages={stage_total_seconds:.0f}s vs csv≈{data_total_seconds:.0f}s). "
+                    "Pass the original --duration/--stage-targets (or --stages-json) to get accurate phase markers."
+                )
 
-    # Print stats
-    print_comparison_table(stats)
+        stats = calculate_stats(latency_df)
+        error_stats = calculate_error_stats(raw_df)
+        if not error_stats.empty:
+            stats = stats.join(
+                error_stats[["errors_4xx", "errors_5xx", "errors_429", "error_rate"]],
+                how="left",
+            ).fillna(0)
+        if len(endpoints) == 2:
+            print_comparison_table(stats, baseline_name=endpoints[0], variant_name=endpoints[1])
+        else:
+            print_endpoint_table(stats, endpoints=endpoints)
+        plot_results(
+            latency_df,
+            stats,
+            chart_path,
+            stages,
+            endpoints,
+            title,
+        )
 
-    # Generate chart
-    plot_results(df, stats, chart_path, duration)
+        if wait_between_scenarios and scenario_name != scenarios[-1]:
+            assert capacity_provider_arn_resolved is not None
+            assert baseline_instance_count is not None
+            wait_for_capacity_provider_scale_in(
+                region=region,
+                capacity_provider_arn=capacity_provider_arn_resolved,
+                baseline_count=baseline_instance_count,
+                check_interval_seconds=scale_in_check_seconds,
+                max_wait_minutes=scale_in_max_minutes,
+            )
 
     print(f"\n{'=' * 70}")
     print("BENCHMARK COMPLETE")

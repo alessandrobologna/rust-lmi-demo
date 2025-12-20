@@ -13,7 +13,7 @@ Parameters:
 
 Globals:
   Function:
-    Timeout: 3
+    Timeout: 30
     Tracing: Active
     LoggingConfig:
       LogFormat: JSON
@@ -45,14 +45,33 @@ Resources:
       LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-access-logs"
       RetentionInDays: 7
 
-
-  HelloWorldFunctionDefault:
+  HelloWorldFunction2048:
     Type: AWS::Serverless::Function
     Metadata:
       BuildMethod: rust-cargolambda
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-default    
-      CodeUri: ./rust_app
+      FunctionName: !Sub ${AWS::StackName}-2048
+      CodeUri: ./
+      Handler: bootstrap
+      Runtime: provided.al2023
+      MemorySize: 2048
+      Architectures:
+      - arm64
+      Events:
+        HelloWorld:
+          Type: Api
+          Properties:
+            RestApiId: !Ref HelloWorldApi
+            Path: /default/2048/hello
+            Method: get
+  
+  HelloWorldFunction128:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: rust-cargolambda
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-128
+      CodeUri: ./
       Handler: bootstrap
       Runtime: provided.al2023
       MemorySize: 128
@@ -63,7 +82,7 @@ Resources:
           Type: Api
           Properties:
             RestApiId: !Ref HelloWorldApi
-            Path: /default/hello
+            Path: /default/128/hello
             Method: get
 
   CapacityProvider:
@@ -88,7 +107,7 @@ Resources:
       BuildMethod: rust-cargolambda
     Properties:
       FunctionName: !Sub ${AWS::StackName}-lmi    
-      CodeUri: ./rust_app 
+      CodeUri: ./
       Handler: bootstrap
       Runtime: provided.al2023
       MemorySize: 2048
@@ -100,25 +119,28 @@ Resources:
         PerExecutionEnvironmentMaxConcurrency: 64
       Environment:
         Variables:
-          RUST_LOG: debug
+          RUST_LOG: info
       Events:
         HelloWorld:
           Type: Api
           Properties:
             RestApiId: !Ref HelloWorldApi
-            Path: /lmi/hello/
+            Path: /lmi/2048/hello
             Method: get
 
 Outputs:
-  HelloWorldApiDefaultEndpoint:
-    Description: API Gateway endpoint URL for prod stage for Default Hello World function
-    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/default/hello"
+  HelloWorldApi2048Endpoint:
+    Description: API Gateway endpoint URL for prod stage for the 2048 MB Hello World function
+    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/default/2048/hello"
+  HelloWorldApi128Endpoint:
+    Description: API Gateway endpoint URL for prod stage for the 128 MB Hello World function
+    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/default/128/hello"
   HelloWorldApiLMIEndpoint:
     Description: API Gateway endpoint URL for prod stage for LMI Hello World function
-    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/lmi/hello/"
-  HelloWorldFunctionDefault:
-    Description: Hello World Lambda Function ARN
-    Value: !GetAtt HelloWorldFunctionDefault.Arn
-  HelloWorldFunctionDefaultIamRole:
-    Description: Implicit IAM Role created for Hello World function
-    Value: !GetAtt HelloWorldFunctionDefaultRole.Arn
+    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/lmi/2048/hello"
+  HelloWorldFunction2048:
+    Description: 2048 MB Hello World Lambda Function ARN
+    Value: !GetAtt HelloWorldFunction2048.Arn
+  HelloWorldFunction128:
+    Description: 128 MB Hello World Lambda Function ARN
+    Value: !GetAtt HelloWorldFunction128.Arn
