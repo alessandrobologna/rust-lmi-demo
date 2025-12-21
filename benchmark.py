@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["boto3>=1.42.1", "matplotlib>=3.8", "click>=8.1", "seaborn>=0.13", "pandas>=2.2"]
+# dependencies = ["boto3>=1.42.1", "matplotlib>=3.8", "click>=8.1", "seaborn>=0.13", "pandas>=2.2", "scipy>=1.11"]
 # ///
 """
 Load test benchmark + plotting script for comparing Lambda endpoints.
@@ -21,15 +21,18 @@ import subprocess
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
 import click
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import seaborn as sns
+from matplotlib.cbook import boxplot_stats
 from matplotlib.patches import Patch
+from scipy.interpolate import make_interp_spline
 
 
 MAX_DELAY_MS = 15_000
@@ -275,6 +278,183 @@ def calculate_error_stats(df: pd.DataFrame) -> pd.DataFrame:
     return errors
 
 
+def fetch_execution_environment_concurrency(
+    *,
+    region: str | None,
+    function_name: str,
+    resource: str,
+    capacity_provider_name: str,
+    start_time: datetime,
+    end_time: datetime,
+    period_seconds: int,
+) -> pd.DataFrame:
+    client = boto3.client("cloudwatch", region_name=region) if region else boto3.client("cloudwatch")
+    metric = {
+        "Namespace": "AWS/Lambda",
+        "MetricName": "ExecutionEnvironmentConcurrency",
+        "Dimensions": [
+            {"Name": "FunctionName", "Value": function_name},
+            {"Name": "Resource", "Value": resource},
+            {"Name": "CapacityProviderName", "Value": capacity_provider_name},
+        ],
+    }
+    queries = [
+        {
+            "Id": "avg",
+            "MetricStat": {"Metric": metric, "Period": period_seconds, "Stat": "Average"},
+            "ReturnData": True,
+        },
+        {
+            "Id": "count",
+            "MetricStat": {"Metric": metric, "Period": period_seconds, "Stat": "SampleCount"},
+            "ReturnData": True,
+        },
+    ]
+    results: dict[str, list[dict]] = {}
+    next_token = None
+    while True:
+        kwargs = {
+            "StartTime": start_time,
+            "EndTime": end_time,
+            "MetricDataQueries": queries,
+            "ScanBy": "TimestampAscending",
+        }
+        if next_token:
+            kwargs["NextToken"] = next_token
+        response = client.get_metric_data(**kwargs)
+        for result in response.get("MetricDataResults", []):
+            results.setdefault(result["Id"], []).append(result)
+        next_token = response.get("NextToken")
+        if not next_token:
+            break
+
+    def merge_series(entries: list[dict]) -> pd.Series:
+        timestamps: list[datetime] = []
+        values: list[float] = []
+        for entry in entries:
+            timestamps.extend(entry.get("Timestamps", []))
+            values.extend(entry.get("Values", []))
+        if not timestamps:
+            return pd.Series(dtype=float)
+        series = pd.Series(values, index=pd.to_datetime(timestamps, utc=True)).sort_index()
+        return series
+
+    avg_series = merge_series(results.get("avg", []))
+    count_series = merge_series(results.get("count", []))
+    df = pd.DataFrame({"average": avg_series, "sample_count": count_series}).sort_index()
+    return df
+
+
+def _smooth_concurrency_series(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    series = series.dropna()
+    if len(series) < 2:
+        return series.index.to_numpy(dtype=float), series.to_numpy(dtype=float)
+    x = series.index.to_numpy(dtype=float)
+    y = series.to_numpy(dtype=float)
+    x_new = np.linspace(x.min(), x.max(), int(x.max() - x.min()) + 1)
+    k = min(3, len(x) - 1)
+    if k < 2:
+        return x_new, np.interp(x_new, x, y)
+    spline = make_interp_spline(x, y, k=k)
+    return x_new, spline(x_new)
+
+
+def draw_execution_environment_concurrency(ax: plt.Axes, df: pd.DataFrame, *, title: str, show_legend: bool) -> None:
+    min_ts = df.index.min()
+    elapsed_seconds = (df.index - min_ts).total_seconds()
+    df_plot = df.copy()
+    df_plot.index = elapsed_seconds
+
+    x_avg, y_avg = _smooth_concurrency_series(df_plot["average"])
+    x_cnt, y_cnt = _smooth_concurrency_series(df_plot["sample_count"])
+
+    line_avg = ax.plot(
+        x_avg,
+        y_avg,
+        label="Concurrency per execution environment",
+        color="#1f77b4",
+        linewidth=2,
+    )[0]
+    line_cnt = ax.plot(
+        x_cnt,
+        y_cnt,
+        label="Execution environment count",
+        color="#ff7f0e",
+        linewidth=2,
+    )[0]
+    ax.set_title(title)
+    ax.set_ylabel("Count")
+    ax.set_xlabel("Elapsed Time (seconds)")
+    if show_legend:
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.2),
+            ncol=2,
+            frameon=False,
+        )
+    return line_avg, line_cnt
+
+
+def plot_execution_environment_concurrency(
+    df: pd.DataFrame,
+    *,
+    output_path: Path,
+    title: str,
+) -> None:
+    if df.empty:
+        print("Warning: no CloudWatch concurrency data to plot.")
+        return
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+    draw_execution_environment_concurrency(ax, df, title=title, show_legend=True)
+    fig.tight_layout(rect=[0, 0.12, 1, 1])
+    fig.savefig(output_path, transparent=True, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote CloudWatch chart: {output_path}")
+
+
+def plot_execution_environment_concurrency_grid(
+    charts: list[tuple[str, pd.DataFrame]],
+    *,
+    output_path: Path,
+    ncols: int = 2,
+) -> None:
+    if not charts:
+        return
+    nrows = (len(charts) + ncols - 1) // ncols
+    # Match the main benchmark chart canvas size/aspect.
+    fig, axes = plt.subplots(nrows, ncols, figsize=(14, 10))
+    axes = np.array(axes).reshape(nrows, ncols)
+    handles = None
+    labels = None
+    idx = 0
+    for r in range(nrows):
+        for c in range(ncols):
+            ax = axes[r, c]
+            if idx >= len(charts):
+                ax.axis("off")
+                continue
+            title, df = charts[idx]
+            line_avg, line_cnt = draw_execution_environment_concurrency(ax, df, title=title, show_legend=False)
+            if handles is None:
+                handles = [line_avg, line_cnt]
+                labels = [line_avg.get_label(), line_cnt.get_label()]
+            idx += 1
+    fig.suptitle("Lambda Managed Instances - Concurrency scaling", fontsize=14, y=0.995, color=".5")
+    if handles and labels:
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.02),
+            ncol=2,
+            frameon=False,
+        )
+    fig.tight_layout(rect=[0, 0.07, 1, 0.96])
+    fig.savefig(output_path, transparent=True, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Wrote combined CloudWatch chart: {output_path}")
+
+
 def plot_results(
     df: pd.DataFrame,
     stats: pd.DataFrame,
@@ -416,6 +596,17 @@ def plot_results(
     ax3.set_xlabel("Endpoint")
     ax3.set_ylabel("Latency (ms)")
     ax3.set_title("Latency Distribution")
+    # Keep the boxplot readable by using whisker bounds instead of extreme outliers
+    stats_by_endpoint = []
+    for endpoint in endpoints:
+        vals = df[df["endpoint"] == endpoint]["latency_ms"].to_numpy()
+        if len(vals) > 0:
+            stats_by_endpoint.append(boxplot_stats(vals, whis=1.5)[0])
+    if stats_by_endpoint:
+        y_min = min(s["whislo"] for s in stats_by_endpoint)
+        y_max = max(s["whishi"] for s in stats_by_endpoint)
+        if y_max > y_min:
+            ax3.set_ylim(y_min * 0.98, y_max * 1.02)
     # legend is shown at the figure level
 
     # Plot 4: Stats comparison
@@ -637,6 +828,33 @@ def print_endpoint_table(stats: pd.DataFrame, *, endpoints: list[str]) -> None:
     show_default=True,
     help="Maximum time to wait for scale-in between scenarios.",
 )
+@click.option(
+    "--cloudwatch-concurrency/--no-cloudwatch-concurrency",
+    default=False,
+    help="Fetch and plot ExecutionEnvironmentConcurrency (Average + SampleCount) for LMI during each scenario window.",
+)
+@click.option(
+    "--cloudwatch-period-seconds",
+    type=int,
+    default=300,
+    show_default=True,
+    help="CloudWatch period (seconds) for ExecutionEnvironmentConcurrency queries.",
+)
+@click.option(
+    "--cloudwatch-function-name",
+    default=None,
+    help="Override LMI FunctionName dimension (default: <stack>-lmi).",
+)
+@click.option(
+    "--cloudwatch-resource",
+    default=None,
+    help="Override LMI Resource dimension (default: <function>:$LATEST.PUBLISHED).",
+)
+@click.option(
+    "--cloudwatch-capacity-provider-name",
+    default=None,
+    help="Override CapacityProviderName dimension (default: <stack>-cp-2-c8xlarge).",
+)
 def main(
     stack_name: str,
     region: str | None,
@@ -654,6 +872,11 @@ def main(
     capacity_provider_arn: str | None,
     scale_in_check_seconds: int,
     scale_in_max_minutes: int,
+    cloudwatch_concurrency: bool,
+    cloudwatch_period_seconds: int,
+    cloudwatch_function_name: str | None,
+    cloudwatch_resource: str | None,
+    cloudwatch_capacity_provider_name: str | None,
 ) -> None:
     """Run load test benchmarks comparing standard vs LMI Lambda endpoints."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -669,21 +892,47 @@ def main(
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    # Get endpoints from CloudFormation
-    print(f"Fetching endpoints from stack: {stack_name}")
-    outputs = get_stack_outputs(stack_name, region)
+    # Get endpoints from CloudFormation (optional when --skip-test)
+    url_2048 = url_128 = url_lmi = None
+    if skip_test:
+        try:
+            print(f"Fetching endpoints from stack: {stack_name}")
+            outputs = get_stack_outputs(stack_name, region)
+            url_2048 = outputs.get("HelloWorldApi2048Endpoint") or outputs.get("HelloWorldApiDefaultEndpoint")
+            url_128 = outputs.get("HelloWorldApi128Endpoint")
+            url_lmi = outputs.get("HelloWorldApiLMIEndpoint")
+            if url_2048 and url_128 and url_lmi:
+                print(f"2048 URL: {url_2048}")
+                print(f"128  URL: {url_128}")
+                print(f"LMI  URL: {url_lmi}")
+            else:
+                print(
+                    "Warning: incomplete stack outputs; continuing with CSV endpoint names only. "
+                    f"Found: {list(outputs.keys())}"
+                )
+        except Exception as e:  # noqa: BLE001 - best-effort for chart regeneration
+            print(f"Warning: failed to fetch stack outputs ({e}); continuing with CSV endpoint names only.")
+    else:
+        print(f"Fetching endpoints from stack: {stack_name}")
+        outputs = get_stack_outputs(stack_name, region)
+        url_2048 = outputs.get("HelloWorldApi2048Endpoint") or outputs.get("HelloWorldApiDefaultEndpoint")
+        url_128 = outputs.get("HelloWorldApi128Endpoint")
+        url_lmi = outputs.get("HelloWorldApiLMIEndpoint")
 
-    url_2048 = outputs.get("HelloWorldApi2048Endpoint") or outputs.get("HelloWorldApiDefaultEndpoint")
-    url_128 = outputs.get("HelloWorldApi128Endpoint")
-    url_lmi = outputs.get("HelloWorldApiLMIEndpoint")
+        if not url_2048 or not url_128 or not url_lmi:
+            raise SystemExit(f"Could not find endpoint outputs. Found: {list(outputs.keys())}")
 
-    if not url_2048 or not url_128 or not url_lmi:
-        raise SystemExit(f"Could not find endpoint outputs. Found: {list(outputs.keys())}")
+        print(f"2048 URL: {url_2048}")
+        if url_128:
+            print(f"128  URL: {url_128}")
+        print(f"LMI  URL: {url_lmi}")
 
-    print(f"2048 URL: {url_2048}")
-    if url_128:
-        print(f"128  URL: {url_128}")
-    print(f"LMI  URL: {url_lmi}")
+    if cloudwatch_concurrency:
+        cw_function_name = cloudwatch_function_name or f"{stack_name}-lmi"
+        cw_resource = cloudwatch_resource or f"{cw_function_name}:$LATEST.PUBLISHED"
+        cw_capacity_provider_name = cloudwatch_capacity_provider_name or f"{stack_name}-cp-2-c8xlarge"
+    else:
+        cw_function_name = cw_resource = cw_capacity_provider_name = None
 
     def timestamp_from_csv_path(path: Path, *, scenario_name: str) -> str | None:
         prefix = f"k6-{scenario_name}-"
@@ -729,6 +978,8 @@ def main(
 
     scenarios = ["fast-io", "slow-io", "low-cpu", "high-cpu"] if scenario == "all" else [scenario]
     wait_between_scenarios = (wait_for_scale_in if wait_for_scale_in is not None else scenario == "all") and not skip_test
+    concurrency_data: dict[str, tuple[str, pd.DataFrame]] = {}
+    combined_timestamp: str | None = None
     capacity_provider_arn_resolved = None
     baseline_instance_count: int | None = None
     if wait_between_scenarios:
@@ -790,6 +1041,7 @@ def main(
         endpoints = [t["name"] for t in endpoint_targets]
         csv_path = output_dir / f"k6-{scenario_name}-{timestamp}.csv"
         chart_path = output_dir / f"benchmark-{scenario_name}-{timestamp}.png"
+        concurrency_chart_path = output_dir / f"cloudwatch-concurrency-{scenario_name}-{timestamp}.png"
 
         print(f"\n{'=' * 70}")
         print(f"SCENARIO: {scenario_display} ({scenario_name})")
@@ -800,7 +1052,12 @@ def main(
             existing_timestamp = timestamp_from_csv_path(csv_path, scenario_name=scenario_name)
             if existing_timestamp:
                 chart_path = output_dir / f"benchmark-{scenario_name}-{existing_timestamp}.png"
+                concurrency_chart_path = output_dir / f"cloudwatch-concurrency-{scenario_name}-{existing_timestamp}.png"
+                if combined_timestamp is None:
+                    combined_timestamp = existing_timestamp
             print(f"Using existing CSV: {csv_path}")
+        elif combined_timestamp is None:
+            combined_timestamp = timestamp
         else:
             print(f"RUNNING TEST: stages={stages}")
             run_k6_test(
@@ -848,6 +1105,32 @@ def main(
             title,
         )
 
+        if cloudwatch_concurrency and cw_function_name and cw_resource and cw_capacity_provider_name:
+            try:
+                start_time = latency_df["timestamp"].min().to_pydatetime().replace(tzinfo=timezone.utc)
+                end_time = latency_df["timestamp"].max().to_pydatetime().replace(tzinfo=timezone.utc) + timedelta(
+                    seconds=cloudwatch_period_seconds
+                )
+                cw_df = fetch_execution_environment_concurrency(
+                    region=region,
+                    function_name=cw_function_name,
+                    resource=cw_resource,
+                    capacity_provider_name=cw_capacity_provider_name,
+                    start_time=start_time,
+                    end_time=end_time,
+                    period_seconds=cloudwatch_period_seconds,
+                )
+                if scenario == "all":
+                    concurrency_data[scenario_name] = (f"{scenario_display} – LMI Concurrency", cw_df)
+                else:
+                    plot_execution_environment_concurrency(
+                        cw_df,
+                        output_path=concurrency_chart_path,
+                        title=f"{scenario_display} – LMI Concurrency",
+                    )
+            except Exception as e:  # noqa: BLE001 - best-effort visualization
+                print(f"Warning: failed to fetch/plot CloudWatch concurrency ({e}).")
+
         if wait_between_scenarios and scenario_name != scenarios[-1]:
             assert capacity_provider_arn_resolved is not None
             assert baseline_instance_count is not None
@@ -858,6 +1141,20 @@ def main(
                 check_interval_seconds=scale_in_check_seconds,
                 max_wait_minutes=scale_in_max_minutes,
             )
+
+    if cloudwatch_concurrency and scenario == "all":
+        ordered = ["fast-io", "slow-io", "low-cpu", "high-cpu"]
+        chart_entries = [concurrency_data.get(name) for name in ordered]
+        if all(chart_entries):
+            combined_name = combined_timestamp or timestamp
+            combined_path = output_dir / f"cloudwatch-concurrency-all-{combined_name}.png"
+            plot_execution_environment_concurrency_grid(
+                chart_entries, output_path=combined_path
+            )
+        else:
+            missing = [name for name, entry in zip(ordered, chart_entries, strict=False) if not entry]
+            if missing:
+                print(f"Warning: missing CloudWatch charts for {', '.join(missing)}; skipping combined output.")
 
     print(f"\n{'=' * 70}")
     print("BENCHMARK COMPLETE")

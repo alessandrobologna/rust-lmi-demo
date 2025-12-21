@@ -17,8 +17,8 @@ Globals:
     Tracing: Active
     LoggingConfig:
       LogFormat: JSON
-      ApplicationLogLevel: DEBUG
-      SystemLogLevel: DEBUG
+      ApplicationLogLevel: INFO
+      SystemLogLevel: INFO
   Api:
     TracingEnabled: true
 
@@ -95,6 +95,9 @@ Resources:
           - !Select [1, !Ref ManagedInstancesSubnetIds]
         SecurityGroupIds:
           - !Ref ManagedInstancesSecurityGroupId
+      ScalingConfig:
+        MaxVCpuCount: 8
+        AverageCPUUtilization: 70.0
       InstanceRequirements:
         AllowedTypes:
           - c8g.xlarge  
