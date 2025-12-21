@@ -1,5 +1,6 @@
 # Rust Lambda Managed Instances (LMI) Demo
 
+![rust-lmi](https://github.com/user-attachments/assets/168d20e3-e249-4161-8dc0-37da950d73cb)
 A demonstration comparing AWS Lambda with standard execution vs Lambda Managed Instances (LMI) capacity provider, using a Rust-based serverless application.
 
 ## Overview
