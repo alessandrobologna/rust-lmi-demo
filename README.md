@@ -121,32 +121,32 @@ When documenting results, note the client machine (instance type + region) becau
 ### Results (2025‑12‑26, m7g.medium in us‑east‑1)
 
 #### Bursty I/O (`delay_ms=500`, target 200→500 rps)
-| Endpoint | Avg (ms) | p95 (ms) | p99 (ms) | 5xx |
-|----------|---------:|---------:|---------:|----:|
-| 128 | 528.0 | 540.2 | 578.1 | 0.00% |
-| 512 | 524.6 | 535.6 | 573.5 | 0.00% |
-| LMI | 523.7 | 536.0 | 573.6 | 0.05% |
+| Endpoint | Avg (ms) | p95 (ms) | p99 (ms) | 5xx (count) | 5xx (%) |
+|----------|---------:|---------:|---------:|------------:|--------:|
+| 128 | 528.0 | 540.2 | 578.1 | 0 | 0.00% |
+| 512 | 524.6 | 535.6 | 573.5 | 0 | 0.00% |
+| LMI | 523.7 | 536.0 | 573.6 | 82 | 0.05% |
 
 #### Steady I/O (`delay_ms=100`, steady 250 rps)
-| Endpoint | Avg (ms) | p95 (ms) | p99 (ms) | 5xx |
-|----------|---------:|---------:|---------:|----:|
-| 128 | 127.0 | 138.7 | 166.6 | 0.00% |
-| 512 | 123.7 | 134.0 | 162.0 | 0.00% |
-| LMI | 123.2 | 134.5 | 160.7 | 0.00% |
+| Endpoint | Avg (ms) | p95 (ms) | p99 (ms) | 5xx (count) | 5xx (%) |
+|----------|---------:|---------:|---------:|------------:|--------:|
+| 128 | 127.0 | 138.7 | 166.6 | 0 | 0.00% |
+| 512 | 123.7 | 134.0 | 162.0 | 0 | 0.00% |
+| LMI | 123.2 | 134.5 | 160.7 | 0 | 0.00% |
 
 #### CPU Break‑point (`hash_loops=200000`, 30→120 rps)
-| Endpoint | Avg (ms) | p95 (ms) | p99 (ms) | 5xx |
-|----------|---------:|---------:|---------:|----:|
-| 128 | 672.2 | 748.3 | 770.8 | 0.00% |
-| 512 | 177.7 | 198.3 | 213.2 | 0.00% |
-| LMI | 272.3 | 940.2 | 1352.6 | 5.85% |
+| Endpoint | Avg (ms) | p95 (ms) | p99 (ms) | 5xx (count) | 5xx (%) |
+|----------|---------:|---------:|---------:|------------:|--------:|
+| 128 | 672.2 | 748.3 | 770.8 | 0 | 0.00% |
+| 512 | 177.7 | 198.3 | 213.2 | 0 | 0.00% |
+| LMI | 272.3 | 940.2 | 1352.6 | 2526 | 5.85% |
 
 #### Mixed I/O + CPU (`delay_ms=50`, `hash_loops=25000`, 150→300 rps)
-| Endpoint | Avg (ms) | p95 (ms) | p99 (ms) | 5xx |
-|----------|---------:|---------:|---------:|----:|
-| 128 | 103.2 | 140.0 | 159.8 | 0.00% |
-| 512 | 79.5 | 89.5 | 108.0 | 0.00% |
-| LMI | 85.1 | 109.6 | 185.8 | 1.91% |
+| Endpoint | Avg (ms) | p95 (ms) | p99 (ms) | 5xx (count) | 5xx (%) |
+|----------|---------:|---------:|---------:|------------:|--------:|
+| 128 | 103.2 | 140.0 | 159.8 | 0 | 0.00% |
+| 512 | 79.5 | 89.5 | 108.0 | 0 | 0.00% |
+| LMI | 85.1 | 109.6 | 185.8 | 2065 | 1.91% |
 
 #### Key Observations
 
@@ -182,6 +182,7 @@ Charts use the same elapsed‑time axis as the k6 plots and apply spline interpo
 ### Notes
 
 - CPU-heavy work does not benefit from high per-environment concurrency. With `ExecutionEnvironmentMemoryGiBPerVCpu: 2` and a 2 GB function, each execution environment gets ~1 vCPU; allowing up to `PerExecutionEnvironmentMaxConcurrency: 64` means CPU-bound requests contend for that vCPU.
+- The current LMI capacity provider config leaves limited horizontal headroom: `MaxVCpuCount: 12` with `c8g.xlarge` (4 vCPU each) caps at 3 instances, and `MaxExecutionEnvironments: 4` further limits scale-out. This makes 5xx under bursty or CPU-heavy load more likely in these tests.
 - Lambda managed instances capacity providers scale gradually; AWS docs say they maintain enough headroom for traffic to double within 5 minutes. If traffic increases faster than this, requests can be throttled. ([AWS docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-scaling.html))
 - If you don’t wait for LMI scale-in between scenarios, later scenarios will start from a pre-scaled capacity provider and won’t show scale-up/backlog behavior from idle. The benchmark can wait automatically when running `--scenario all` (disable with `--no-wait-for-scale-in`).
 - The latency scatter plot is downsampled and the points are shuffled (per endpoint) to reduce overdraw; the CSV contains the full dataset.
