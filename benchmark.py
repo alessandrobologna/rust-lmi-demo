@@ -193,6 +193,7 @@ def run_k6_test(
     env["STAGES"] = json.dumps(stages)
     if mode is not None:
         env["MODE"] = mode
+    env.setdefault("EXECUTOR", "ramping-arrival-rate")
     env["DELAY_MS"] = str(delay_ms)
     env["HASH_LOOPS"] = str(hash_loops)
 
@@ -206,10 +207,21 @@ def run_k6_test(
     print(f"  STAGES={env['STAGES']}")
     if mode is not None:
         print(f"  MODE={mode}")
+        if env.get("EXECUTOR"):
+            print(f"  EXECUTOR={env['EXECUTOR']}")
         if mode == "per_endpoint":
             try:
-                peak_vus = max(int(s["target"]) for s in stages)
-                print(f"  NOTE: per_endpoint runs one k6 scenario per endpoint (peak total VUs ≈ {peak_vus * len(targets)})")
+                peak_target = max(int(s["target"]) for s in stages)
+                if env.get("EXECUTOR") == "ramping-arrival-rate":
+                    print(
+                        "  NOTE: per_endpoint runs one k6 scenario per endpoint "
+                        f"(peak total rps ≈ {peak_target * len(targets)})"
+                    )
+                else:
+                    print(
+                        "  NOTE: per_endpoint runs one k6 scenario per endpoint "
+                        f"(peak total VUs ≈ {peak_target * len(targets)})"
+                    )
             except Exception:
                 pass
     for t in targets:
@@ -345,6 +357,23 @@ def fetch_execution_environment_concurrency(
     return df
 
 
+def save_execution_environment_concurrency_csv(df: pd.DataFrame, path: Path) -> None:
+    if df.empty:
+        return
+    out = df.copy()
+    out = out.reset_index().rename(columns={"index": "timestamp"})
+    out.to_csv(path, index=False)
+
+
+def load_execution_environment_concurrency_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if df.empty:
+        return pd.DataFrame()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+    df = df.set_index("timestamp").sort_index()
+    return df
+
+
 def _smooth_concurrency_series(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
     series = series.dropna()
     if len(series) < 2:
@@ -359,7 +388,29 @@ def _smooth_concurrency_series(series: pd.Series) -> tuple[np.ndarray, np.ndarra
     return x_new, spline(x_new)
 
 
-def draw_execution_environment_concurrency(ax: plt.Axes, df: pd.DataFrame, *, title: str, show_legend: bool) -> None:
+def _compute_stage_markers(stages: list[dict], data_max_elapsed: float) -> tuple[bool, list[float]]:
+    if not stages:
+        return False, []
+    stage_durations = [parse_duration_to_seconds(s["duration"]) for s in stages]
+    stage_ends = []
+    total = 0.0
+    for duration in stage_durations:
+        total += duration
+        stage_ends.append(total)
+    if not stage_ends:
+        return False, []
+    show = abs(stage_ends[-1] - data_max_elapsed) <= max(30.0, data_max_elapsed * 0.10)
+    return show, stage_ends
+
+
+def draw_execution_environment_concurrency(
+    ax: plt.Axes,
+    df: pd.DataFrame,
+    *,
+    title: str,
+    show_legend: bool,
+    stages: list[dict] | None = None,
+) -> None:
     min_ts = df.index.min()
     elapsed_seconds = (df.index - min_ts).total_seconds()
     df_plot = df.copy()
@@ -375,7 +426,8 @@ def draw_execution_environment_concurrency(ax: plt.Axes, df: pd.DataFrame, *, ti
         color="#1f77b4",
         linewidth=2,
     )[0]
-    line_cnt = ax.plot(
+    ax_count = ax.twinx()
+    line_cnt = ax_count.plot(
         x_cnt,
         y_cnt,
         label="Execution environment count",
@@ -383,10 +435,33 @@ def draw_execution_environment_concurrency(ax: plt.Axes, df: pd.DataFrame, *, ti
         linewidth=2,
     )[0]
     ax.set_title(title)
-    ax.set_ylabel("Count")
+    ax.set_ylabel("Concurrency per execution environment")
+    ax_count.set_ylabel("Execution environment count")
+    ax_count.tick_params(axis="y", colors=".5")
     ax.set_xlabel("Elapsed Time (seconds)")
+    data_max_elapsed = float(df_plot.index.max()) if len(df_plot.index) else 0.0
+    if stages:
+        show_markers, stage_ends = _compute_stage_markers(stages, data_max_elapsed)
+        if show_markers:
+            for x in stage_ends[:-1]:
+                ax.axvline(x=x, color="gray", linestyle="--", alpha=0.5)
+            ymax = ax.get_ylim()[1] if ax.get_ylim()[1] else 1
+            starts = [0] + stage_ends[:-1]
+            for i, (start, end) in enumerate(zip(starts, stage_ends, strict=False)):
+                start_target = 0 if i == 0 else int(stages[i - 1]["target"])
+                end_target = int(stages[i]["target"])
+                ax.text(
+                    (start + end) / 2,
+                    ymax * 0.95,
+                    f"{start_target}→{end_target} rps",
+                    ha="center",
+                    fontsize=9,
+                    color=".5",
+                )
     if show_legend:
         ax.legend(
+            [line_avg, line_cnt],
+            [line_avg.get_label(), line_cnt.get_label()],
             loc="upper center",
             bbox_to_anchor=(0.5, -0.2),
             ncol=2,
@@ -400,12 +475,13 @@ def plot_execution_environment_concurrency(
     *,
     output_path: Path,
     title: str,
+    stages: list[dict] | None = None,
 ) -> None:
     if df.empty:
         print("Warning: no CloudWatch concurrency data to plot.")
         return
     fig, ax = plt.subplots(figsize=(10, 5.5))
-    draw_execution_environment_concurrency(ax, df, title=title, show_legend=True)
+    draw_execution_environment_concurrency(ax, df, title=title, show_legend=True, stages=stages)
     fig.tight_layout(rect=[0, 0.12, 1, 1])
     fig.savefig(output_path, transparent=True, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -417,6 +493,7 @@ def plot_execution_environment_concurrency_grid(
     *,
     output_path: Path,
     ncols: int = 2,
+    stages: list[dict] | None = None,
 ) -> None:
     if not charts:
         return
@@ -434,7 +511,13 @@ def plot_execution_environment_concurrency_grid(
                 ax.axis("off")
                 continue
             title, df = charts[idx]
-            line_avg, line_cnt = draw_execution_environment_concurrency(ax, df, title=title, show_legend=False)
+            line_avg, line_cnt = draw_execution_environment_concurrency(
+                ax,
+                df,
+                title=title,
+                show_legend=False,
+                stages=stages,
+            )
             if handles is None:
                 handles = [line_avg, line_cnt]
                 labels = [line_avg.get_label(), line_cnt.get_label()]
@@ -482,7 +565,7 @@ def plot_results(
         "legend.labelcolor": ".5",
     })
 
-    default_colors = {"128": "#4C78A8", "2048": "#F58518", "LMI": "#E45756", "lmi": "#E45756"}
+    default_colors = {"128": "#4C78A8", "512": "#F58518", "LMI": "#E45756", "lmi": "#E45756"}
     fallback_colors = sns.color_palette("tab10", n_colors=max(len(endpoints), 3)).as_hex()
     fallback_iter = iter(fallback_colors)
     palette = {}
@@ -543,7 +626,7 @@ def plot_results(
             ax1.text(
                 (start + end) / 2,
                 ymax * 0.95,
-                f"{start_target}→{end_target} VUs",
+                f"{start_target}→{end_target} rps",
                 ha="center",
                 fontsize=9,
                 color=".5",
@@ -745,7 +828,7 @@ def print_endpoint_table(stats: pd.DataFrame, *, endpoints: list[str]) -> None:
 @click.option(
     "--stage-targets",
     default=None,
-    help="Comma-separated k6 stage targets (each uses --duration), e.g. '20,20,40'. Overrides the default 0→64 (3m), 64→64 (6m), 64→128 (3m) phases.",
+    help="Comma-separated arrival-rate targets (rps). Each target uses --duration. Overrides scenario defaults.",
 )
 @click.option(
     "--stages-json",
@@ -754,42 +837,50 @@ def print_endpoint_table(stats: pd.DataFrame, *, endpoints: list[str]) -> None:
 )
 @click.option(
     "--scenario",
-    type=click.Choice(["fast-io", "slow-io", "low-cpu", "high-cpu", "all"]),
+    type=click.Choice(["bursty-io", "steady-io", "cpu-break", "mixed", "all"]),
     default="all",
     show_default=True,
-    help="Which scenario(s) to run: fast-io, slow-io, low-cpu, high-cpu, or all.",
+    help="Which scenario(s) to run: bursty-io, steady-io, cpu-break, mixed, or all.",
 )
 @click.option(
-    "--cpu-low-hash-loops",
-    "--cpu-hash-loops",
-    "cpu_low_hash_loops",
-    type=int,
-    default=50_000,
-    show_default=True,
-    help="hash_loops used for the Low CPU scenario (delay_ms=0).",
-)
-@click.option(
-    "--cpu-high-hash-loops",
+    "--cpu-break-hash-loops",
+    "cpu_break_hash_loops",
     type=int,
     default=200_000,
     show_default=True,
-    help="hash_loops used for the High CPU scenario (delay_ms=0).",
+    help="hash_loops used for the CPU break-point scenario (delay_ms=0).",
 )
 @click.option(
-    "--io-fast-delay-ms",
-    "--io-delay-ms",
-    "io_fast_delay_ms",
+    "--steady-io-delay-ms",
+    "steady_io_delay_ms",
     type=int,
     default=100,
     show_default=True,
-    help="delay_ms used for the Fast I/O scenario (hash_loops=0).",
+    help="delay_ms used for the Steady I/O scenario (hash_loops=0).",
 )
 @click.option(
-    "--io-slow-delay-ms",
+    "--bursty-io-delay-ms",
+    "bursty_io_delay_ms",
     type=int,
     default=500,
     show_default=True,
-    help="delay_ms used for the Slow I/O scenario (hash_loops=0).",
+    help="delay_ms used for the Bursty I/O scenario (hash_loops=0).",
+)
+@click.option(
+    "--mixed-delay-ms",
+    "mixed_delay_ms",
+    type=int,
+    default=50,
+    show_default=True,
+    help="delay_ms used for the Mixed scenario.",
+)
+@click.option(
+    "--mixed-hash-loops",
+    "mixed_hash_loops",
+    type=int,
+    default=25_000,
+    show_default=True,
+    help="hash_loops used for the Mixed scenario.",
 )
 @click.option(
     "--output-dir",
@@ -855,6 +946,12 @@ def print_endpoint_table(stats: pd.DataFrame, *, endpoints: list[str]) -> None:
     default=None,
     help="Override CapacityProviderName dimension (default: <stack>-cp-2-c8xlarge).",
 )
+@click.option(
+    "--refresh-cloudwatch",
+    is_flag=True,
+    default=False,
+    help="Re-fetch CloudWatch concurrency data even if cached CSVs exist (useful with --skip-test).",
+)
 def main(
     stack_name: str,
     region: str | None,
@@ -862,10 +959,11 @@ def main(
     stage_targets: str | None,
     stages_json: str | None,
     scenario: str,
-    cpu_low_hash_loops: int,
-    cpu_high_hash_loops: int,
-    io_fast_delay_ms: int,
-    io_slow_delay_ms: int,
+    cpu_break_hash_loops: int,
+    steady_io_delay_ms: int,
+    bursty_io_delay_ms: int,
+    mixed_delay_ms: int,
+    mixed_hash_loops: int,
     output_dir: Path,
     skip_test: bool,
     wait_for_scale_in: bool | None,
@@ -877,32 +975,35 @@ def main(
     cloudwatch_function_name: str | None,
     cloudwatch_resource: str | None,
     cloudwatch_capacity_provider_name: str | None,
+    refresh_cloudwatch: bool,
 ) -> None:
     """Run load test benchmarks comparing standard vs LMI Lambda endpoints."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if io_fast_delay_ms < 0 or io_fast_delay_ms > MAX_DELAY_MS:
-        raise SystemExit(f"--io-fast-delay-ms must be between 0 and {MAX_DELAY_MS}")
-    if io_slow_delay_ms < 0 or io_slow_delay_ms > MAX_DELAY_MS:
-        raise SystemExit(f"--io-slow-delay-ms must be between 0 and {MAX_DELAY_MS}")
-    if cpu_low_hash_loops < 0 or cpu_low_hash_loops > MAX_HASH_LOOPS:
-        raise SystemExit(f"--cpu-low-hash-loops must be between 0 and {MAX_HASH_LOOPS}")
-    if cpu_high_hash_loops < 0 or cpu_high_hash_loops > MAX_HASH_LOOPS:
-        raise SystemExit(f"--cpu-high-hash-loops must be between 0 and {MAX_HASH_LOOPS}")
+    if steady_io_delay_ms < 0 or steady_io_delay_ms > MAX_DELAY_MS:
+        raise SystemExit(f"--steady-io-delay-ms must be between 0 and {MAX_DELAY_MS}")
+    if bursty_io_delay_ms < 0 or bursty_io_delay_ms > MAX_DELAY_MS:
+        raise SystemExit(f"--bursty-io-delay-ms must be between 0 and {MAX_DELAY_MS}")
+    if mixed_delay_ms < 0 or mixed_delay_ms > MAX_DELAY_MS:
+        raise SystemExit(f"--mixed-delay-ms must be between 0 and {MAX_DELAY_MS}")
+    if cpu_break_hash_loops < 0 or cpu_break_hash_loops > MAX_HASH_LOOPS:
+        raise SystemExit(f"--cpu-break-hash-loops must be between 0 and {MAX_HASH_LOOPS}")
+    if mixed_hash_loops < 0 or mixed_hash_loops > MAX_HASH_LOOPS:
+        raise SystemExit(f"--mixed-hash-loops must be between 0 and {MAX_HASH_LOOPS}")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
     # Get endpoints from CloudFormation (optional when --skip-test)
-    url_2048 = url_128 = url_lmi = None
+    url_512 = url_128 = url_lmi = None
     if skip_test:
         try:
             print(f"Fetching endpoints from stack: {stack_name}")
             outputs = get_stack_outputs(stack_name, region)
-            url_2048 = outputs.get("HelloWorldApi2048Endpoint") or outputs.get("HelloWorldApiDefaultEndpoint")
+            url_512 = outputs.get("HelloWorldApi512Endpoint") or outputs.get("HelloWorldApiDefaultEndpoint")
             url_128 = outputs.get("HelloWorldApi128Endpoint")
             url_lmi = outputs.get("HelloWorldApiLMIEndpoint")
-            if url_2048 and url_128 and url_lmi:
-                print(f"2048 URL: {url_2048}")
+            if url_512 and url_128 and url_lmi:
+                print(f"512  URL: {url_512}")
                 print(f"128  URL: {url_128}")
                 print(f"LMI  URL: {url_lmi}")
             else:
@@ -915,14 +1016,14 @@ def main(
     else:
         print(f"Fetching endpoints from stack: {stack_name}")
         outputs = get_stack_outputs(stack_name, region)
-        url_2048 = outputs.get("HelloWorldApi2048Endpoint") or outputs.get("HelloWorldApiDefaultEndpoint")
+        url_512 = outputs.get("HelloWorldApi512Endpoint") or outputs.get("HelloWorldApiDefaultEndpoint")
         url_128 = outputs.get("HelloWorldApi128Endpoint")
         url_lmi = outputs.get("HelloWorldApiLMIEndpoint")
 
-        if not url_2048 or not url_128 or not url_lmi:
+        if not url_512 or not url_128 or not url_lmi:
             raise SystemExit(f"Could not find endpoint outputs. Found: {list(outputs.keys())}")
 
-        print(f"2048 URL: {url_2048}")
+        print(f"512  URL: {url_512}")
         if url_128:
             print(f"128  URL: {url_128}")
         print(f"LMI  URL: {url_lmi}")
@@ -942,10 +1043,10 @@ def main(
 
     if stages_json:
         try:
-            stages = json.loads(stages_json)
+            global_stages = json.loads(stages_json)
         except json.JSONDecodeError as e:
             raise SystemExit(f"Invalid --stages-json: {e}") from e
-        if not isinstance(stages, list) or not stages:
+        if not isinstance(global_stages, list) or not global_stages:
             raise SystemExit("--stages-json must be a non-empty JSON array")
     elif stage_targets:
         try:
@@ -954,21 +1055,21 @@ def main(
             raise SystemExit("--stage-targets must be a comma-separated list of integers") from e
         if not stage_target_values:
             raise SystemExit("--stage-targets must contain at least one target")
-        stages = [{"duration": duration, "target": t} for t in stage_target_values]
+        global_stages = [{"duration": duration, "target": t} for t in stage_target_values]
     else:
-        stages = [
-            {"duration": "3m", "target": 64},
-            {"duration": "6m", "target": 64},
-            {"duration": "3m", "target": 128},
-        ]
+        global_stages = None
 
-    try:
-        for stage in stages:
-            parse_duration_to_seconds(stage["duration"])
-            if int(stage["target"]) < 0:
-                raise ValueError("target must be non-negative")
-    except (KeyError, TypeError, ValueError) as e:
-        raise SystemExit(f"Invalid stages configuration: {e}") from e
+    def validate_stages(stage_list: list[dict]) -> None:
+        try:
+            for stage in stage_list:
+                parse_duration_to_seconds(stage["duration"])
+                if int(stage["target"]) < 0:
+                    raise ValueError("target must be non-negative")
+        except (KeyError, TypeError, ValueError) as e:
+            raise SystemExit(f"Invalid stages configuration: {e}") from e
+
+    if global_stages is not None:
+        validate_stages(global_stages)
 
     def latest_csv_for(scenario_name: str) -> Path:
         csv_files = sorted(output_dir.glob(f"k6-{scenario_name}-*.csv"), reverse=True)
@@ -976,7 +1077,7 @@ def main(
             raise SystemExit(f"No CSV found for scenario '{scenario_name}'. Run without --skip-test first.")
         return csv_files[0]
 
-    scenarios = ["fast-io", "slow-io", "low-cpu", "high-cpu"] if scenario == "all" else [scenario]
+    scenarios = ["bursty-io", "steady-io", "cpu-break", "mixed"] if scenario == "all" else [scenario]
     wait_between_scenarios = (wait_for_scale_in if wait_for_scale_in is not None else scenario == "all") and not skip_test
     concurrency_data: dict[str, tuple[str, pd.DataFrame]] = {}
     combined_timestamp: str | None = None
@@ -1010,38 +1111,65 @@ def main(
                 baseline_instance_count = None
     for scenario_name in scenarios:
         scenario_display = {
-            "fast-io": "Fast I/O",
-            "slow-io": "Slow I/O",
-            "low-cpu": "Low CPU",
-            "high-cpu": "High CPU",
+            "bursty-io": "Bursty I/O",
+            "steady-io": "Steady I/O",
+            "cpu-break": "CPU Break-point",
+            "mixed": "Mixed I/O + CPU",
         }.get(scenario_name, scenario_name)
         endpoint_targets = [
             {"name": "128", "url": url_128},
-            {"name": "2048", "url": url_2048},
+            {"name": "512", "url": url_512},
             {"name": "LMI", "url": url_lmi},
         ]
 
-        if scenario_name == "fast-io":
-            delay_ms, hash_loops = io_fast_delay_ms, 0
-            title = f"Lambda Load Test (Fast I/O wait): 128 vs 2048 vs LMI (delay_ms={delay_ms})"
-        elif scenario_name == "slow-io":
-            delay_ms, hash_loops = io_slow_delay_ms, 0
-            title = f"Lambda Load Test (Slow I/O wait): 128 vs 2048 vs LMI (delay_ms={delay_ms})"
-        elif scenario_name == "low-cpu":
-            delay_ms, hash_loops = 0, cpu_low_hash_loops
-            title = f"Lambda Load Test (Low CPU): 128 vs 2048 vs LMI (hash_loops={hash_loops})"
-        elif scenario_name == "high-cpu":
-            delay_ms, hash_loops = 0, cpu_high_hash_loops
-            title = f"Lambda Load Test (High CPU): 128 vs 2048 vs LMI (hash_loops={hash_loops})"
+        if scenario_name == "bursty-io":
+            delay_ms, hash_loops = bursty_io_delay_ms, 0
+            title = f"Lambda Load Test (Bursty I/O): 128 vs 512 vs LMI (delay_ms={delay_ms})"
+            default_stages = [
+                {"duration": "3m", "target": 200},
+                {"duration": "6m", "target": 200},
+                {"duration": "3m", "target": 500},
+            ]
+        elif scenario_name == "steady-io":
+            delay_ms, hash_loops = steady_io_delay_ms, 0
+            title = f"Lambda Load Test (Steady I/O): 128 vs 512 vs LMI (delay_ms={delay_ms})"
+            default_stages = [
+                {"duration": "3m", "target": 250},
+                {"duration": "6m", "target": 250},
+                {"duration": "3m", "target": 250},
+            ]
+        elif scenario_name == "cpu-break":
+            delay_ms, hash_loops = 0, cpu_break_hash_loops
+            title = f"Lambda Load Test (CPU Break-point): 128 vs 512 vs LMI (hash_loops={hash_loops})"
+            default_stages = [
+                {"duration": "3m", "target": 30},
+                {"duration": "3m", "target": 60},
+                {"duration": "3m", "target": 90},
+                {"duration": "3m", "target": 120},
+            ]
+        elif scenario_name == "mixed":
+            delay_ms, hash_loops = mixed_delay_ms, mixed_hash_loops
+            title = (
+                "Lambda Load Test (Mixed I/O + CPU): 128 vs 512 vs LMI "
+                f"(delay_ms={delay_ms}, hash_loops={hash_loops})"
+            )
+            default_stages = [
+                {"duration": "3m", "target": 150},
+                {"duration": "6m", "target": 150},
+                {"duration": "3m", "target": 300},
+            ]
         else:
             raise SystemExit(f"Unknown scenario: {scenario_name}")
 
         mode = "per_endpoint"
+        stages = global_stages if global_stages is not None else default_stages
+        validate_stages(stages)
 
         endpoints = [t["name"] for t in endpoint_targets]
         csv_path = output_dir / f"k6-{scenario_name}-{timestamp}.csv"
         chart_path = output_dir / f"benchmark-{scenario_name}-{timestamp}.png"
         concurrency_chart_path = output_dir / f"cloudwatch-concurrency-{scenario_name}-{timestamp}.png"
+        concurrency_csv_path = output_dir / f"cloudwatch-concurrency-{scenario_name}-{timestamp}.csv"
 
         print(f"\n{'=' * 70}")
         print(f"SCENARIO: {scenario_display} ({scenario_name})")
@@ -1053,12 +1181,13 @@ def main(
             if existing_timestamp:
                 chart_path = output_dir / f"benchmark-{scenario_name}-{existing_timestamp}.png"
                 concurrency_chart_path = output_dir / f"cloudwatch-concurrency-{scenario_name}-{existing_timestamp}.png"
+                concurrency_csv_path = output_dir / f"cloudwatch-concurrency-{scenario_name}-{existing_timestamp}.csv"
                 if combined_timestamp is None:
                     combined_timestamp = existing_timestamp
             print(f"Using existing CSV: {csv_path}")
-        elif combined_timestamp is None:
-            combined_timestamp = timestamp
         else:
+            if combined_timestamp is None:
+                combined_timestamp = timestamp
             print(f"RUNNING TEST: stages={stages}")
             run_k6_test(
                 endpoint_targets,
@@ -1107,19 +1236,24 @@ def main(
 
         if cloudwatch_concurrency and cw_function_name and cw_resource and cw_capacity_provider_name:
             try:
-                start_time = latency_df["timestamp"].min().to_pydatetime().replace(tzinfo=timezone.utc)
-                end_time = latency_df["timestamp"].max().to_pydatetime().replace(tzinfo=timezone.utc) + timedelta(
-                    seconds=cloudwatch_period_seconds
-                )
-                cw_df = fetch_execution_environment_concurrency(
-                    region=region,
-                    function_name=cw_function_name,
-                    resource=cw_resource,
-                    capacity_provider_name=cw_capacity_provider_name,
-                    start_time=start_time,
-                    end_time=end_time,
-                    period_seconds=cloudwatch_period_seconds,
-                )
+                cw_df = None
+                if skip_test and concurrency_csv_path.exists() and not refresh_cloudwatch:
+                    cw_df = load_execution_environment_concurrency_csv(concurrency_csv_path)
+                if cw_df is None or cw_df.empty:
+                    start_time = latency_df["timestamp"].min().to_pydatetime().replace(tzinfo=timezone.utc)
+                    end_time = latency_df["timestamp"].max().to_pydatetime().replace(tzinfo=timezone.utc) + timedelta(
+                        seconds=cloudwatch_period_seconds
+                    )
+                    cw_df = fetch_execution_environment_concurrency(
+                        region=region,
+                        function_name=cw_function_name,
+                        resource=cw_resource,
+                        capacity_provider_name=cw_capacity_provider_name,
+                        start_time=start_time,
+                        end_time=end_time,
+                        period_seconds=cloudwatch_period_seconds,
+                    )
+                    save_execution_environment_concurrency_csv(cw_df, concurrency_csv_path)
                 if scenario == "all":
                     concurrency_data[scenario_name] = (f"{scenario_display} – LMI Concurrency", cw_df)
                 else:
@@ -1127,6 +1261,7 @@ def main(
                         cw_df,
                         output_path=concurrency_chart_path,
                         title=f"{scenario_display} – LMI Concurrency",
+                        stages=stages,
                     )
             except Exception as e:  # noqa: BLE001 - best-effort visualization
                 print(f"Warning: failed to fetch/plot CloudWatch concurrency ({e}).")
@@ -1143,13 +1278,15 @@ def main(
             )
 
     if cloudwatch_concurrency and scenario == "all":
-        ordered = ["fast-io", "slow-io", "low-cpu", "high-cpu"]
+        ordered = ["bursty-io", "steady-io", "cpu-break", "mixed"]
         chart_entries = [concurrency_data.get(name) for name in ordered]
         if all(chart_entries):
             combined_name = combined_timestamp or timestamp
             combined_path = output_dir / f"cloudwatch-concurrency-all-{combined_name}.png"
             plot_execution_environment_concurrency_grid(
-                chart_entries, output_path=combined_path
+                chart_entries,
+                output_path=combined_path,
+                stages=stages,
             )
         else:
             missing = [name for name, entry in zip(ordered, chart_entries, strict=False) if not entry]

@@ -4,6 +4,7 @@ import exec from 'k6/execution';
 
 // Configuration - passed via environment variables
 const MODE = __ENV.MODE || 'batch'; // batch | per_endpoint
+const EXECUTOR = __ENV.EXECUTOR || 'ramping-arrival-rate'; // ramping-arrival-rate | ramping-vus
 const TARGETS_JSON = __ENV.TARGETS;
 const BASELINE_URL = __ENV.BASELINE_URL;
 const VARIANT_URL = __ENV.VARIANT_URL;
@@ -12,6 +13,11 @@ const VARIANT_NAME = __ENV.VARIANT_NAME || 'variant';
 const STAGES_JSON = __ENV.STAGES;
 const DURATION = __ENV.DURATION || '30s';
 const VUS = parseInt(__ENV.VUS || '50');
+const ARRIVAL_TIME_UNIT = __ENV.ARRIVAL_TIME_UNIT || '1s';
+const ARRIVAL_PREALLOCATED_VUS = parseInt(__ENV.ARRIVAL_PREALLOCATED_VUS || '0');
+const ARRIVAL_MAX_VUS = parseInt(__ENV.ARRIVAL_MAX_VUS || '0');
+const ARRIVAL_VUS_MULTIPLIER = parseFloat(__ENV.ARRIVAL_VUS_MULTIPLIER || '1');
+const ARRIVAL_MAX_VUS_MULTIPLIER = parseFloat(__ENV.ARRIVAL_MAX_VUS_MULTIPLIER || '2');
 const DELAY_MS = parseInt(__ENV.DELAY_MS || '0');
 const HASH_LOOPS = parseInt(__ENV.HASH_LOOPS || '0');
 const MAX_DELAY_MS = 15000;
@@ -108,6 +114,16 @@ function parseStages() {
 
 const TARGETS = parseTargets();
 const STAGES = parseStages();
+const PEAK_STAGE_TARGET = Math.max(...STAGES.map((stage) => stage.target));
+
+function resolveArrivalVUs() {
+  const base = Math.max(1, Math.ceil(PEAK_STAGE_TARGET * ARRIVAL_VUS_MULTIPLIER));
+  const max = Math.max(base, Math.ceil(PEAK_STAGE_TARGET * ARRIVAL_MAX_VUS_MULTIPLIER));
+  return {
+    preAllocatedVUs: ARRIVAL_PREALLOCATED_VUS > 0 ? ARRIVAL_PREALLOCATED_VUS : base,
+    maxVUs: ARRIVAL_MAX_VUS > 0 ? ARRIVAL_MAX_VUS : max,
+  };
+}
 
 function withWorkloadParams(url) {
   const sep = url.includes('?') ? '&' : '?';
@@ -129,13 +145,26 @@ for (const t of TARGETS) {
 export const options = (() => {
   if (MODE === 'per_endpoint') {
     const scenarios = {};
+    const arrivalVus = resolveArrivalVUs();
     for (const t of TARGETS) {
       const scenarioName = scenarioNameFor(t.name);
-      scenarios[scenarioName] = {
-        executor: 'ramping-vus',
-        stages: STAGES,
-        exec: 'hitTarget',
-      };
+      if (EXECUTOR === 'ramping-arrival-rate') {
+        scenarios[scenarioName] = {
+          executor: 'ramping-arrival-rate',
+          startRate: 0,
+          timeUnit: ARRIVAL_TIME_UNIT,
+          stages: STAGES,
+          preAllocatedVUs: arrivalVus.preAllocatedVUs,
+          maxVUs: arrivalVus.maxVUs,
+          exec: 'hitTarget',
+        };
+      } else {
+        scenarios[scenarioName] = {
+          executor: 'ramping-vus',
+          stages: STAGES,
+          exec: 'hitTarget',
+        };
+      }
     }
     return { scenarios, thresholds };
   }
@@ -158,7 +187,9 @@ export function hitTarget() {
     [`${t.name}: status is 200`]: (r) => r.status === 200,
   });
 
-  sleep(0.1);
+  if (EXECUTOR !== 'ramping-arrival-rate') {
+    sleep(0.1);
+  }
 }
 
 export default function () {
@@ -181,5 +212,7 @@ export default function () {
     });
   }
 
-  sleep(0.1);
+  if (EXECUTOR !== 'ramping-arrival-rate') {
+    sleep(0.1);
+  }
 }

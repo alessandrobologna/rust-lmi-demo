@@ -45,16 +45,16 @@ Resources:
       LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}-access-logs"
       RetentionInDays: 7
 
-  HelloWorldFunction2048:
+  HelloWorldFunction512:
     Type: AWS::Serverless::Function
     Metadata:
       BuildMethod: rust-cargolambda
     Properties:
-      FunctionName: !Sub ${AWS::StackName}-2048
+      FunctionName: !Sub ${AWS::StackName}-512
       CodeUri: ./
       Handler: bootstrap
       Runtime: provided.al2023
-      MemorySize: 2048
+      MemorySize: 512
       Architectures:
       - arm64
       Events:
@@ -62,7 +62,7 @@ Resources:
           Type: Api
           Properties:
             RestApiId: !Ref HelloWorldApi
-            Path: /default/2048/hello
+            Path: /default/512/hello
             Method: get
   
   HelloWorldFunction128:
@@ -96,7 +96,7 @@ Resources:
         SecurityGroupIds:
           - !Ref ManagedInstancesSecurityGroupId
       ScalingConfig:
-        MaxVCpuCount: 8
+        MaxVCpuCount: 12
         AverageCPUUtilization: 70.0
       InstanceRequirements:
         AllowedTypes:
@@ -120,6 +120,9 @@ Resources:
         Arn: !GetAtt CapacityProvider.Arn
         ExecutionEnvironmentMemoryGiBPerVCpu: 2
         PerExecutionEnvironmentMaxConcurrency: 64
+      FunctionScalingConfig:
+        MinExecutionEnvironments: 1
+        MaxExecutionEnvironments: 4
       Environment:
         Variables:
           RUST_LOG: info
@@ -132,18 +135,18 @@ Resources:
             Method: get
 
 Outputs:
-  HelloWorldApi2048Endpoint:
-    Description: API Gateway endpoint URL for prod stage for the 2048 MB Hello World function
-    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/default/2048/hello"
+  HelloWorldApi512Endpoint:
+    Description: API Gateway endpoint URL for prod stage for the 512 MB Hello World function
+    Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/default/512/hello"
   HelloWorldApi128Endpoint:
     Description: API Gateway endpoint URL for prod stage for the 128 MB Hello World function
     Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/default/128/hello"
   HelloWorldApiLMIEndpoint:
     Description: API Gateway endpoint URL for prod stage for LMI Hello World function
     Value: !Sub "https://${HelloWorldApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/lmi/2048/hello"
-  HelloWorldFunction2048:
-    Description: 2048 MB Hello World Lambda Function ARN
-    Value: !GetAtt HelloWorldFunction2048.Arn
+  HelloWorldFunction512:
+    Description: 512 MB Hello World Lambda Function ARN
+    Value: !GetAtt HelloWorldFunction512.Arn
   HelloWorldFunction128:
     Description: 128 MB Hello World Lambda Function ARN
     Value: !GetAtt HelloWorldFunction128.Arn
