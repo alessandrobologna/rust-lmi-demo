@@ -12,8 +12,10 @@ This project deploys three Rust Lambda functions behind API Gateway:
 | `/default/512/hello` | 512 MB | Standard Lambda | Modest CPU baseline |
 | `/lmi/2048/hello` | 2048 MB | LMI | Lambda Managed Instances with concurrent execution |
 
-The LMI function uses a [forked aws-lambda-rust-runtime](https://github.com/alessandrobologna/aws-lambda-rust-runtime/tree/feat/concurrent-lambda-runtime) that supports handling multiple concurrent requests within a single execution environment. 
-The [benchmark.py][benchmark.py] script uses k6 to run multiple scenario, simulating common workloads.
+> [!IMPORTANT]
+> The LMI function uses a [forked aws-lambda-rust-runtime](https://github.com/alessandrobologna/aws-lambda-rust-runtime/tree/feat/concurrent-lambda-runtime) that supports handling multiple concurrent requests within a single execution environment. This capability is not yet available in the [official AWS rust lambda runtime, PR is pending](https://github.com/aws/aws-lambda-rust-runtime/pull/1067).
+
+The [benchmark.py](benchmark.py) script uses k6 to run multiple scenario, simulating common workloads.
 
 
 ### LMI Configuration
