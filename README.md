@@ -2,19 +2,18 @@
 
 ![rust-lmi](https://github.com/user-attachments/assets/f587645f-8d75-4a70-8cf3-e9956127bbe0)
 
-A demonstration comparing AWS Lambda with standard execution vs Lambda Managed Instances (LMI) capacity provider, using a Rust-based serverless application.
-
 ## Overview
 
 This project deploys three Rust Lambda functions behind API Gateway:
 
 | Endpoint | Memory | Capacity Provider | Description |
 |----------|--------|-------------------|-------------|
-| `/default/128/hello` | 128 MB | Standard Lambda | Low-memory baseline |
+| `/default/128/hello` | 128 MB | Standard Lambda | Low CPU baseline |
 | `/default/512/hello` | 512 MB | Standard Lambda | Modest CPU baseline |
 | `/lmi/2048/hello` | 2048 MB | LMI | Lambda Managed Instances with concurrent execution |
 
-The LMI function uses a [forked aws-lambda-rust-runtime](https://github.com/alessandrobologna/aws-lambda-rust-runtime/tree/feat/concurrent-lambda-runtime) that supports handling multiple concurrent requests within a single execution environment.
+The LMI function uses a [forked aws-lambda-rust-runtime](https://github.com/alessandrobologna/aws-lambda-rust-runtime/tree/feat/concurrent-lambda-runtime) that supports handling multiple concurrent requests within a single execution environment. 
+The [benchmark.py][benchmark.py] script uses k6 to run multiple scenario, simulating common workloads.
 
 
 ### LMI Configuration
@@ -25,6 +24,8 @@ The LMI Lambda is configured with:
 - Capacity provider instance type: `c8g.xlarge` (arm64)
 - Capacity provider subnets: 2 (the first two IDs from `ManagedInstancesSubnetIds`)
 - Capacity provider baseline during tests: 2 instances (scale-in target)
+
+See the [template.yaml](template.yaml) for the complete configuration.
 
 ## Prerequisites
 
@@ -116,8 +117,6 @@ If `--cloudwatch-concurrency` is enabled, the script also writes CloudWatch conc
 It also saves the raw CloudWatch series so charts can be regenerated later:
 - `benchmark-results/cloudwatch-concurrency-<scenario>-<timestamp>.csv` (used automatically when replotting with `--skip-test`)
 
-When documenting results, note the client machine (instance type + region) because it can affect tail latency under high rates.
-
 ### Results (2025‑12‑26, m7g.medium in us‑east‑1)
 
 #### Bursty I/O (`delay_ms=500`, target 200→500 rps)
@@ -150,7 +149,7 @@ When documenting results, note the client machine (instance type + region) becau
 
 #### Key Observations
 
-- **Steady I/O:** All three are stable. 512 and LMI are essentially tied on tail latency; 128 is consistently slower.
+- **Steady I/O:** All three are stable. 512 and LMI are essentially tied on tail latency; 128 is consistently just a little (~2%) slower.
 - **Bursty I/O:** Latency stays similar across endpoints, but LMI shows a small 5xx rate during the spike (0.05%), while standard Lambdas remain clean.
 - **CPU break‑point:** LMI shows 5xx even in the first stage and becomes worse than 512 by **~60 rps**, then degrades sharply at 120 rps (p95 > 1s, 5.85% 5xx). This is the clearest break‑point where a modest 512 MB standard Lambda outperforms LMI for CPU‑bound work.
 - **Mixed:** LMI stays close to 512 at low rate, but tail latency and 5xx rise in the final ramp (stage 3 p99 ≈ 227 ms, 5.1% 5xx), while 512 remains stable.
@@ -182,7 +181,7 @@ Charts use the same elapsed‑time axis as the k6 plots and apply spline interpo
 ### Notes
 
 - CPU-heavy work does not benefit from high per-environment concurrency. With `ExecutionEnvironmentMemoryGiBPerVCpu: 2` and a 2 GB function, each execution environment gets ~1 vCPU; allowing up to `PerExecutionEnvironmentMaxConcurrency: 64` means CPU-bound requests contend for that vCPU.
-- The current LMI capacity provider config leaves limited horizontal headroom: `MaxVCpuCount: 12` with `c8g.xlarge` (4 vCPU each) caps at 3 instances, and `MaxExecutionEnvironments: 4` further limits scale-out. This makes 5xx under bursty or CPU-heavy load more likely in these tests.
+- The current LMI capacity provider config intentionally limits horizontal headroom (to expose the break‑point): `MaxVCpuCount: 12` with `c8g.xlarge` (4 vCPU each) caps at 3 instances, and `MaxExecutionEnvironments: 4` further limits scale‑out. This makes 5xx under bursty or CPU‑heavy load more likely in these tests.
 - Lambda managed instances capacity providers scale gradually; AWS docs say they maintain enough headroom for traffic to double within 5 minutes. If traffic increases faster than this, requests can be throttled. ([AWS docs](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-scaling.html))
 - If you don’t wait for LMI scale-in between scenarios, later scenarios will start from a pre-scaled capacity provider and won’t show scale-up/backlog behavior from idle. The benchmark can wait automatically when running `--scenario all` (disable with `--no-wait-for-scale-in`).
 - The latency scatter plot is downsampled and the points are shuffled (per endpoint) to reduce overdraw; the CSV contains the full dataset.
